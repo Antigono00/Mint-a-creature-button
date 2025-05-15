@@ -3782,7 +3782,7 @@ def check_creature_mint_status():
         traceback.print_exc()
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
-@app.route("/api/getUserCreatures", methods=["GET"])
+@app.route("/api/getUserCreatures", methods=["GET", "POST"])
 def get_user_creatures():
     try:
         if 'telegram_id' not in session:
@@ -3790,32 +3790,38 @@ def get_user_creatures():
 
         user_id = session['telegram_id']
         
-        conn = get_db_connection()
-        cur = conn.cursor()
+        # Get account address - prioritize different sources
+        account_address = None
         
-        # First check if we have a stored Radix account for this user
-        # For production we need a table to store account addresses
-        cur.execute("""
-            SELECT radix_account_address FROM users 
-            WHERE user_id = ? AND radix_account_address IS NOT NULL
-        """, (user_id,))
-        
-        row = cur.fetchone()
-        account_address = row['radix_account_address'] if row else None
-        
-        # If no stored account, try to get account address from request
+        # 1. First try request body (POST)
+        if request.method == "POST" and request.json:
+            account_address = request.json.get("accountAddress")
+            print(f"Using account address from POST body: {account_address}")
+            
+        # 2. Then try query parameters (GET)
+        if not account_address and request.args:
+            account_address = request.args.get("accountAddress")
+            print(f"Using account address from URL params: {account_address}")
+            
+        # 3. Finally try stored account
         if not account_address:
-            try:
-                data = request.json or {}
-                account_address = data.get("accountAddress")
-            except:
-                # Fallback to query param
-                account_address = request.args.get("accountAddress")
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            cur.execute("""
+                SELECT radix_account_address FROM users 
+                WHERE user_id = ? AND radix_account_address IS NOT NULL
+            """, (user_id,))
+            
+            row = cur.fetchone()
+            if row:
+                account_address = row['radix_account_address']
+                print(f"Using stored account address: {account_address}")
+            
+            cur.close()
+            conn.close()
         
-        cur.close()
-        conn.close()
-        
-        # If no account address found, return empty list
+        # If still no account address, return empty list
         if not account_address:
             print(f"No Radix account address found for user {user_id}")
             return jsonify({"creatures": []})

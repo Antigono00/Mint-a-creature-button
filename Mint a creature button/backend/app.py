@@ -851,7 +851,7 @@ def fetch_user_nfts(account_address, resource_address=CREATURE_NFT_RESOURCE, pag
 # FIXED: Updated fetch_nft_data function
 def fetch_nft_data(resource_address, nft_ids, page_limit=100):
     """
-    Fetch data for specific NFT IDs using the current Radix Gateway API spec (v0.3+).
+    Fetch data for specific NFT IDs using the current Radix Gateway API spec (v1.10+).
     Returns a dictionary mapping NFT IDs to their metadata.
     """
     if not nft_ids:
@@ -928,15 +928,26 @@ def fetch_nft_data(resource_address, nft_ids, page_limit=100):
             # Parse the JSON response
             data = response.json()
             
-            # Get the NFT data with proper structure handling for v0.3+ API
-            # Fixed: Accessing the nested structure correctly
-            for item in data.get("items", []):          #  <-- correct key
+            # NEW: Access the direct array in non_fungible_ids instead of items
+            for item in data.get("non_fungible_ids", []):
                 nft_id = item.get("non_fungible_id")
-                mutable   = item.get("mutable_data", {})   or {}
-                immutable = item.get("immutable_data", {}) or {}
-                raw_json  = mutable.get("raw_json") or immutable.get("raw_json")
-                if nft_id and raw_json is not None:
-                    all_nft_data[nft_id] = raw_json
+                data_blob = item.get("data", {}) or {}
+                
+                # NEW: Get programmatic_json instead of raw_json
+                raw_data = data_blob.get("programmatic_json", {})
+                
+                # Optional: Flatten structure if your data is in fields
+                if raw_data.get("kind") == "Struct" and "fields" in raw_data:
+                    flattened_data = {}
+                    for field in raw_data.get("fields", []):
+                        field_name = field.get("field_name")
+                        field_value = field.get("value")
+                        if field_name:
+                            flattened_data[field_name] = field_value
+                    raw_data = flattened_data
+                
+                if nft_id:
+                    all_nft_data[nft_id] = raw_data
             
         print(f"Total NFTs data retrieved: {len(all_nft_data)}")
         return all_nft_data

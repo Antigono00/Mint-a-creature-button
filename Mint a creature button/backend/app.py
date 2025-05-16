@@ -832,8 +832,8 @@ def fetch_user_nfts(account_address, resource_address=CREATURE_NFT_RESOURCE, pag
                 result = response.json()
                 items = result.get("items", [])
                 
-                # Extract NFT IDs
-                all_nft_ids.extend([item.get("non_fungible_id") for item in items if item.get("non_fungible_id")])
+                # Extract NFT IDs - Fixed: items are already the NFT IDs
+                all_nft_ids.extend(items)
                 
                 # Check for cursor for next page
                 cursor = result.get("next_cursor")
@@ -929,16 +929,12 @@ def fetch_nft_data(resource_address, nft_ids, page_limit=100):
             data = response.json()
             
             # Get the NFT data with proper structure handling for v0.3+ API
-            for item in data.get("non_fungible_ids", []):
+            # Fixed: Accessing the nested structure correctly
+            for item in data.get("items", []):          #  <-- correct key
                 nft_id = item.get("non_fungible_id")
-                
-                # New format: Check both mutable_data and immutable_data
-                mutable_data = item.get("mutable_data", {}) or {}
-                immutable_data = item.get("immutable_data", {}) or {}
-                
-                # Try to get raw_json from either data source (already decoded by Gateway)
-                raw_json = mutable_data.get("raw_json") or immutable_data.get("raw_json")
-                
+                mutable   = item.get("mutable_data", {})   or {}
+                immutable = item.get("immutable_data", {}) or {}
+                raw_json  = mutable.get("raw_json") or immutable.get("raw_json")
                 if nft_id and raw_json is not None:
                     all_nft_data[nft_id] = raw_json
             
@@ -1243,7 +1239,7 @@ def diagnose_nft_fetch():
                 # Step 4: Get NFT data for one ID
                 try:
                     if nft_items:
-                        first_nft_id = nft_items[0].get("non_fungible_id")
+                        first_nft_id = nft_items[0]  # directly use the ID string
                         
                         data_response = requests.post(
                             f"{gateway_url}/state/non-fungible/data",
@@ -2240,7 +2236,7 @@ def build_machine():
         has_room_column = True
         try:
             cur.execute("PRAGMA table_info(user_machines)")
-            columns = [column[1] for column in cursor.fetchall()]
+            columns = [column[1] for column in cur.fetchall()]
             has_provisional_mint = 'provisional_mint' in columns
             has_room_column = 'room' in columns
         except:

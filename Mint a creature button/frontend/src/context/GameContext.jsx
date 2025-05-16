@@ -273,6 +273,37 @@ export const GameProvider = ({ children }) => {
     }
   }, [roomsUnlocked]);
 
+  // API helper functions for Evolving Creatures
+  // Function to fetch all the user's creatures from the blockchain
+  const getCreatureNfts = useCallback(async (accountAddress) => {
+    try {
+      // Use our API endpoint to get all user creatures
+      const response = await fetch('/api/getUserCreatures', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          accountAddress: accountAddress
+        }),
+        credentials: 'same-origin'
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      console.log("Creatures data:", data);
+      
+      return data.creatures || [];
+    } catch (error) {
+      console.error("Error loading creatures:", error);
+      throw error;
+    }
+  }, []);
+
   // Load creature NFTs and related items - ADDED
   const loadCreatureNfts = useCallback(async () => {
     try {
@@ -1239,6 +1270,7 @@ export const GameProvider = ({ children }) => {
         toolNfts,
         spellNfts,
         loadCreatureNfts,
+        getCreatureNfts,
 
         // Add these to the contextValue object in the return statement
         showCreatureMinter,

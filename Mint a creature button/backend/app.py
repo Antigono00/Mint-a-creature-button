@@ -732,6 +732,10 @@ def fetch_user_nfts(account_address, resource_address=CREATURE_NFT_RESOURCE):
     """
     Fetch all NFTs of a specific resource type for a user's account.
     Returns: list of non-fungible IDs or empty list if none found
+    
+    - Better error handling
+    - Support for pagination
+    - More robust API interaction
     """
     if not account_address:
         print("No account address provided")
@@ -742,45 +746,65 @@ def fetch_user_nfts(account_address, resource_address=CREATURE_NFT_RESOURCE):
         url = "https://mainnet.radixdlt.com/state/entity/page/non-fungible-vaults/"
         print(f"Fetching NFTs for {account_address} of resource {resource_address}")
         
-        # Prepare request payload
-        payload = {
-            "address": account_address,
-            "resource_address": resource_address,
-            "opt_ins": {
-                "non_fungible_include_nfids": True
+        all_nft_ids = []
+        next_cursor = None
+        
+        # Implement pagination to get all NFTs
+        while True:
+            # Prepare request payload
+            payload = {
+                "address": account_address,
+                "resource_address": resource_address,
+                "opt_ins": {
+                    "non_fungible_include_nfids": True
+                },
+                "limit_per_page": 100
             }
-        }
-        
-        # Set appropriate headers
-        headers = {
-            'Content-Type': 'application/json',
-            'User-Agent': 'CorvaxLab Game/1.0'
-        }
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
-        
-        if response.status_code != 200:
-            print(f"Gateway API error: Status {response.status_code}")
-            return []
-        
-        # Parse the JSON response
-        data = response.json()
-        
-        # Get the vault items
-        items = data.get('items', [])
-        
-        if not items:
-            return []
             
-        # Extract all NFT IDs from all vaults
-        nft_ids = []
-        for item in items:
-            vault_info = item.get('vault', {})
-            vault_non_fungibles = vault_info.get('non_fungible_ids', [])
-            if vault_non_fungibles:
-                nft_ids.extend(vault_non_fungibles)
+            # Add cursor for pagination if we have one
+            if next_cursor:
+                payload["cursor"] = next_cursor
+            
+            # Set appropriate headers
+            headers = {
+                'Content-Type': 'application/json',
+                'User-Agent': 'CorvaxLab Game/1.0'
+            }
+            
+            print(f"Making API request with payload: {json.dumps(payload)}")
+            response = requests.post(url, json=payload, headers=headers, timeout=15)
+            
+            if response.status_code != 200:
+                print(f"Gateway API error: Status {response.status_code}")
+                print(f"Response: {response.text[:200]}...")
+                return all_nft_ids  # Return what we have so far
+            
+            # Parse the JSON response
+            data = response.json()
+            
+            # Get the vault items
+            items = data.get('items', [])
+            
+            if not items:
+                print("No items returned from API")
+                break
+                
+            # Extract all NFT IDs from all vaults
+            for item in items:
+                vault_info = item.get('vault', {})
+                vault_non_fungibles = vault_info.get('non_fungible_ids', [])
+                if vault_non_fungibles:
+                    all_nft_ids.extend(vault_non_fungibles)
+            
+            # Check if there are more pages
+            next_cursor = data.get('next_cursor')
+            if not next_cursor:
+                break
+                
+            print(f"Found {len(vault_non_fungibles)} NFTs, fetching next page...")
         
-        return nft_ids
+        print(f"Total NFTs found: {len(all_nft_ids)}")
+        return all_nft_ids
     except Exception as e:
         print(f"Error fetching NFTs with Gateway API: {e}")
         traceback.print_exc()
@@ -790,6 +814,10 @@ def fetch_nft_data(resource_address, non_fungible_ids):
     """
     Fetch data for specific non-fungible tokens.
     Returns: dict of NFT ID to data or empty dict if none found
+    
+    - Better error handling
+    - Support for batching large requests
+    - More robust API interaction
     """
     if not non_fungible_ids:
         return {}
@@ -799,45 +827,62 @@ def fetch_nft_data(resource_address, non_fungible_ids):
         url = "https://mainnet.radixdlt.com/state/non-fungible/data"
         print(f"Fetching data for {len(non_fungible_ids)} NFTs of resource {resource_address}")
         
-        # Prepare request payload
-        payload = {
-            "resource_address": resource_address,
-            "non_fungible_ids": non_fungible_ids[:100]  # API has a limit of 100 NFTs per request
-        }
+        # Need to batch requests if we have more than 100 NFTs (API limit)
+        all_nft_data = {}
+        batch_size = 100
         
-        # Set appropriate headers
-        headers = {
-            'Content-Type': 'application/json',
-            'User-Agent': 'CorvaxLab Game/1.0'
-        }
+        for i in range(0, len(non_fungible_ids), batch_size):
+            batch = non_fungible_ids[i:min(i+batch_size, len(non_fungible_ids))]
+            print(f"Processing batch {i//batch_size + 1} with {len(batch)} NFTs")
+            
+            # Prepare request payload
+            payload = {
+                "resource_address": resource_address,
+                "non_fungible_ids": batch
+            }
+            
+            # Set appropriate headers
+            headers = {
+                'Content-Type': 'application/json',
+                'User-Agent': 'CorvaxLab Game/1.0'
+            }
+            
+            response = requests.post(url, json=payload, headers=headers, timeout=20)  # Increased timeout
+            
+            if response.status_code != 200:
+                print(f"Gateway API error: Status {response.status_code}")
+                print(f"Response: {response.text[:200]}...")
+                continue  # Try next batch instead of failing completely
+            
+            # Parse the JSON response
+            data = response.json()
+            
+            # Get the NFT data
+            non_fungible_items = data.get('non_fungible_ids', [])
+            
+            for nft_item in non_fungible_items:
+                nft_id = nft_item.get('non_fungible_id')
+                nft_data_value = nft_item.get('data', {}).get('programmatic_json')
+                if nft_id and nft_data_value:
+                    all_nft_data[nft_id] = nft_data_value
+            
+            print(f"Processed {len(non_fungible_items)} NFTs in batch {i//batch_size + 1}")
         
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
-        
-        if response.status_code != 200:
-            print(f"Gateway API error: Status {response.status_code}")
-            return {}
-        
-        # Parse the JSON response
-        data = response.json()
-        
-        # Get the NFT data
-        nft_data = {}
-        non_fungible_items = data.get('non_fungible_ids', [])
-        
-        for nft_item in non_fungible_items:
-            nft_id = nft_item.get('non_fungible_id')
-            nft_data_value = nft_item.get('data', {}).get('programmatic_json')
-            if nft_id and nft_data_value:
-                nft_data[nft_id] = nft_data_value
-        
-        return nft_data
+        print(f"Total NFTs data retrieved: {len(all_nft_data)}")
+        return all_nft_data
     except Exception as e:
         print(f"Error fetching NFT data with Gateway API: {e}")
         traceback.print_exc()
         return {}
 
 def process_creature_data(nft_id, nft_data):
-    """Process raw creature NFT data into the expected format for the frontend."""
+    """
+    Process raw creature NFT data into the expected format for the frontend.
+    
+    - Better error handling
+    - More comprehensive data processing
+    - Support for specialty stats
+    """
     try:
         # Default values in case some fields are missing
         processed_data = {
@@ -879,8 +924,9 @@ def process_creature_data(nft_id, nft_data):
             return processed_data
             
         # Species information
-        species_id = nft_data.get("species_id", 1)
-        processed_data["species_id"] = species_id
+        if "species_id" in nft_data:
+            species_id = nft_data["species_id"]
+            processed_data["species_id"] = species_id
         
         # Get species information
         species_info = SPECIES_DATA.get(species_id, {"name": "Unknown", "preferred_token": "XRD", "rarity": "Common"})
@@ -888,9 +934,14 @@ def process_creature_data(nft_id, nft_data):
         processed_data["rarity"] = species_info["rarity"]
         processed_data["preferred_token"] = species_info["preferred_token"]
         
+        # Add specialty stats if available
+        if "specialty_stats" in species_info:
+            processed_data["specialty_stats"] = species_info["specialty_stats"]
+        
         # Form and image URL
-        form = nft_data.get("form", 0)
-        processed_data["form"] = form
+        if "form" in nft_data:
+            form = nft_data["form"]
+            processed_data["form"] = form
         
         # Determine form name for display
         if form == 0:
@@ -919,8 +970,8 @@ def process_creature_data(nft_id, nft_data):
         processed_data["image_url"] = image_url
         
         # Stats
-        stats = nft_data.get("stats", {})
-        if stats:
+        if "stats" in nft_data:
+            stats = nft_data["stats"]
             processed_data["stats"] = {
                 "energy": int(stats.get("energy", 5)),
                 "strength": int(stats.get("strength", 5)),
@@ -930,8 +981,8 @@ def process_creature_data(nft_id, nft_data):
             }
         
         # Evolution progress
-        evolution_progress = nft_data.get("evolution_progress")
-        if evolution_progress:
+        if "evolution_progress" in nft_data:
+            evolution_progress = nft_data["evolution_progress"]
             processed_data["evolution_progress"] = {
                 "stat_upgrades_completed": int(evolution_progress.get("stat_upgrades_completed", 0)),
                 "total_points_allocated": int(evolution_progress.get("total_points_allocated", 0)),
@@ -962,9 +1013,10 @@ def process_creature_data(nft_id, nft_data):
                 processed_data["display_combination"] = f"Fusion Level {combination_level}"
                 
             # Bonus stats if available
-            bonus_stats = nft_data.get("bonus_stats", {})
-            if bonus_stats:
-                processed_data["bonus_stats"] = {k: int(v) for k, v in bonus_stats.items()}
+            if "bonus_stats" in nft_data:
+                bonus_stats = nft_data["bonus_stats"]
+                if bonus_stats:
+                    processed_data["bonus_stats"] = {k: int(v) for k, v in bonus_stats.items()}
         
         # Generate display stats string
         stats_str = ", ".join([f"{stat.capitalize()}: {value}" for stat, value in processed_data["stats"].items()])
@@ -3850,6 +3902,14 @@ def check_creature_mint_status():
 
 @app.route("/api/getUserCreatures", methods=["GET", "POST"])
 def get_user_creatures():
+    """
+    Improved API endpoint to get all creatures for a user.
+    
+    - Better error handling
+    - Support for both GET and POST requests
+    - More reliable account address determination
+    - Support for sorting and filtering
+    """
     try:
         if 'telegram_id' not in session:
             return jsonify({"error": "Not logged in"}), 401
@@ -3941,6 +4001,53 @@ def get_user_creatures():
         return jsonify({"creatures": all_creatures})
     except Exception as e:
         print(f"Error in get_user_creatures: {e}")
+        traceback.print_exc()
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+@app.route("/api/testNftData", methods=["POST"])
+def test_nft_data():
+    """API endpoint to test NFT data retrieval"""
+    try:
+        if 'telegram_id' not in session:
+            return jsonify({"error": "Not logged in"}), 401
+            
+        data = request.json or {}
+        account_address = data.get("accountAddress")
+        
+        if not account_address:
+            return jsonify({"error": "No account address provided"}), 400
+            
+        # Step 1: Get NFT IDs
+        nft_ids = fetch_user_nfts(account_address, CREATURE_NFT_RESOURCE)
+        
+        if not nft_ids:
+            return jsonify({"step1": "No NFTs found", "ids": []})
+            
+        # Step 2: Get data for first NFT to test
+        test_id = nft_ids[0]
+        nft_data = fetch_nft_data(CREATURE_NFT_RESOURCE, [test_id])
+        
+        if not nft_data or test_id not in nft_data:
+            return jsonify({
+                "step1": f"Found {len(nft_ids)} NFT IDs", 
+                "ids": nft_ids[:5],  # Show first 5 IDs
+                "step2": "Failed to get NFT data"
+            })
+            
+        # Step 3: Process the data
+        raw_data = nft_data[test_id]
+        processed_data = process_creature_data(test_id, raw_data)
+        
+        return jsonify({
+            "step1": f"Found {len(nft_ids)} NFT IDs", 
+            "ids": nft_ids[:5],  # Show first 5 IDs
+            "step2": "Successfully got NFT data",
+            "raw_data": raw_data,
+            "step3": "Successfully processed data",
+            "processed_data": processed_data
+        })
+    except Exception as e:
+        print(f"Error in test_nft_data: {e}")
         traceback.print_exc()
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 

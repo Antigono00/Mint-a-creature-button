@@ -12,7 +12,7 @@ const EvolvingCreatureMinter = ({ onClose }) => {
     isMobile
   } = useContext(GameContext);
 
-  // Radix Connect context
+  // From the RadixConnect context
   const {
     connected,
     accounts,
@@ -30,11 +30,18 @@ const EvolvingCreatureMinter = ({ onClose }) => {
   const [mintedCreature, setMintedCreature] = useState(null);
   const [mintedItem, setMintedItem] = useState(null);
 
+  // Balance checking states
+  const [isLoadingBalance, setIsLoadingBalance] = useState(false);
+  const [xrdBalance, setXrdBalance] = useState(null);
+  const [balanceErrorMessage, setBalanceErrorMessage] = useState("");
+  const [hasSuccessfullyMintedBefore, setHasSuccessfullyMintedBefore] = useState(false);
+
   // Constants
   const MINT_PRICE = 250; // XRD cost for minting a creature egg
-  const [hasEnoughXrd, setHasEnoughXrd] = useState(true); // We'll assume true initially
-  const [xrdBalance, setXrdBalance] = useState(null); // Track actual XRD balance
   
+  // We're getting isMobile from GameContext, so no need to check here
+  // This removes the code that was causing the setIsMobile error
+
   // Check connection status
   useEffect(() => {
     if (!connected) {
@@ -44,12 +51,15 @@ const EvolvingCreatureMinter = ({ onClose }) => {
     } else {
       setConnectionStatus('ready');
     }
+    setIsLoading(false);
   }, [connected, accounts]);
 
-  // Check if the user has enough XRD
+  // Simplified XRD balance check - just informational, doesn't block minting
   useEffect(() => {
     const checkXrdBalance = async () => {
       if (!connected || !accounts || accounts.length === 0) return;
+      
+      setIsLoadingBalance(true);
       
       try {
         // Use our backend endpoint to check XRD balance
@@ -64,25 +74,96 @@ const EvolvingCreatureMinter = ({ onClose }) => {
           credentials: 'same-origin'
         });
         
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        
         const data = await response.json();
         console.log("XRD balance check:", data);
         
-        setHasEnoughXrd(data.hasEnoughXrd);
-        setXrdBalance(data.xrdBalance);
+        if (response.ok) {
+          // Just store the balance for display - don't block the mint button
+          setXrdBalance(data.xrdBalance);
+          
+          // Store any status message, but don't block minting
+          if (data.statusMessage) {
+            setBalanceErrorMessage(data.statusMessage);
+          } else {
+            setBalanceErrorMessage("");
+          }
+        } else {
+          console.error("XRD balance check failed:", data.error || "Unknown error");
+          // Store the error message
+          setBalanceErrorMessage(data.statusMessage || "Failed to check XRD balance");
+        }
       } catch (error) {
         console.error("Error checking XRD balance:", error);
-        // We'll be lenient and allow the mint attempt even if balance check fails
-        // The transaction will ultimately fail in the wallet if they don't have enough
-        setHasEnoughXrd(true);
+        setBalanceErrorMessage("Network error checking balance");
+      } finally {
+        setIsLoadingBalance(false);
       }
     };
     
     checkXrdBalance();
   }, [connected, accounts]);
+
+  // Add this function to refresh the balance manually
+  const refreshBalance = async () => {
+    if (!connected || !accounts || accounts.length === 0) return;
+    
+    setIsLoadingBalance(true);
+    
+    try {
+      const response = await fetch('/api/checkXrdBalance', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          accountAddress: accounts[0].address,
+          forceRefresh: true // Add this flag to indicate a refresh request
+        }),
+        credentials: 'same-origin'
+      });
+      
+      const data = await response.json();
+      console.log("XRD balance refresh:", data);
+      
+      setXrdBalance(data.xrdBalance);
+      
+      if (data.xrdBalance > 0) {
+        setBalanceErrorMessage("");
+      } else {
+        setBalanceErrorMessage(data.statusMessage || "Balance still shows as zero");
+      }
+    } catch (error) {
+      console.error("Error refreshing XRD balance:", error);
+      setBalanceErrorMessage("Error refreshing balance");
+    } finally {
+      setIsLoadingBalance(false);
+    }
+  };
+
+  // Add this to update the successful mint tracking
+  useEffect(() => {
+    // When a mint is successful, update our state
+    if (mintingStage === 'success') {
+      setHasSuccessfullyMintedBefore(true);
+      
+      // Save this in localStorage to persist across sessions
+      try {
+        localStorage.setItem('hasMintedBefore', 'true');
+      } catch (e) {
+        console.error("Could not save mint status to localStorage:", e);
+      }
+    }
+  }, [mintingStage]);
+
+  // Check for past successful mints on component mount
+  useEffect(() => {
+    try {
+      const hasMinted = localStorage.getItem('hasMintedBefore') === 'true';
+      setHasSuccessfullyMintedBefore(hasMinted);
+    } catch (e) {
+      console.error("Could not read mint status from localStorage:", e);
+    }
+  }, []);
 
   // Poll transaction status if we have an intent hash
   useEffect(() => {
@@ -276,19 +357,19 @@ const EvolvingCreatureMinter = ({ onClose }) => {
             {mintingStage === 'init' && (
               <button
                 onClick={handleMint}
-                disabled={isLoading || connectionStatus !== 'ready' || !hasEnoughXrd}
+                disabled={isLoading || connectionStatus !== 'ready'}
                 style={{
-                  backgroundColor: connectionStatus === 'ready' && hasEnoughXrd ? '#2196F3' : '#999',
-                  opacity: connectionStatus === 'ready' && hasEnoughXrd ? 1 : 0.7,
+                  backgroundColor: connectionStatus === 'ready' ? '#2196F3' : '#999',
+                  opacity: connectionStatus === 'ready' ? 1 : 0.7,
                   padding: '8px 16px',
                   borderRadius: '5px',
                   border: 'none',
                   color: '#fff',
-                  cursor: connectionStatus === 'ready' && hasEnoughXrd ? 'pointer' : 'not-allowed',
+                  cursor: connectionStatus === 'ready' ? 'pointer' : 'not-allowed',
                   fontWeight: 'bold'
                 }}
               >
-                {!hasEnoughXrd ? 'Not Enough XRD' : 'Mint Egg (250 XRD)'}
+                Mint Egg (250 XRD)
               </button>
             )}
             
@@ -478,20 +559,75 @@ const EvolvingCreatureMinter = ({ onClose }) => {
                   <p style={{ fontSize: '24px', fontWeight: 'bold', margin: '0', color: '#2196F3' }}>
                     250 XRD
                   </p>
-                  {xrdBalance !== null && (
+                  
+                  {/* Balance display - purely informational */}
+                  {isLoadingBalance ? (
+                    <p style={{ fontSize: '14px', margin: '10px 0 0 0', color: '#FFD700' }}>
+                      Checking balance...
+                    </p>
+                  ) : xrdBalance !== null ? (
                     <p style={{ 
                       fontSize: '14px', 
                       margin: '10px 0 0 0', 
-                      color: hasEnoughXrd ? '#4CAF50' : '#F44336'
+                      color: xrdBalance >= 250 ? '#4CAF50' : '#FF9800'  // Yellow warning instead of red for low balance
                     }}>
                       Your Balance: {xrdBalance.toFixed(2)} XRD
+                      
+                      {/* Show refresh button if needed */}
+                      {xrdBalance === 0 && (
+                        <button 
+                          onClick={refreshBalance}
+                          style={{
+                            backgroundColor: 'transparent',
+                            border: 'none',
+                            color: '#2196F3',
+                            cursor: 'pointer',
+                            marginLeft: '10px',
+                            textDecoration: 'underline',
+                            fontSize: '12px',
+                            padding: '0'
+                          }}
+                        >
+                          Refresh
+                        </button>
+                      )}
+                    </p>
+                  ) : (
+                    <p style={{ fontSize: '14px', margin: '10px 0 0 0', color: '#FFD700' }}>
+                      Couldn't verify balance
                     </p>
                   )}
+                  
+                  {/* Show balance error message if present */}
+                  {balanceErrorMessage && (
+                    <p style={{ 
+                      fontSize: '12px', 
+                      margin: '5px 0 0 0', 
+                      color: '#FF9800',
+                      fontStyle: 'italic'
+                    }}>
+                      Note: {balanceErrorMessage}
+                    </p>
+                  )}
+                  
+                  {/* Optional note for low balance */}
+                  {xrdBalance !== null && xrdBalance < 250 && (
+                    <p style={{ 
+                      fontSize: '12px', 
+                      margin: '5px 0 0 0', 
+                      color: '#FF9800'
+                    }}>
+                      Note: Transaction may fail if XRD is insufficient
+                    </p>
+                  )}
+                  
                   <p style={{ fontSize: '14px', margin: '10px 0 0 0', opacity: 0.7 }}>
                     Your NFTs will be sent to: <span style={{ fontWeight: 'bold' }}>{accounts[0]?.address.slice(0, 10) + '...' + accounts[0]?.address.slice(-10)}</span>
                   </p>
                 </div>
               </div>
+              
+              {/* Remove the manual override section completely */}
             </div>
           )}
 
@@ -658,10 +794,10 @@ const EvolvingCreatureMinter = ({ onClose }) => {
               }}>
                 <h4 style={{ margin: '0 0 10px 0' }}>What's Next:</h4>
                 <ol style={{ margin: 0, paddingLeft: '20px' }}>
-                  <li style={{ margin: '5px 0' }}>Upgrade your creature's stats using the Radix wallet</li>
+                  <li style={{ margin: '5px 0' }}>You can upgrade your creature stats</li>
                   <li style={{ margin: '5px 0' }}>Evolve your creature when it's ready</li>
                   <li style={{ margin: '5px 0' }}>
-                    Visit <a href="https://addix.meme" target="_blank" rel="noopener noreferrer" style={{ color: '#2196F3' }}>addix.meme</a> to view your NFTs
+                    Visit <a href="https://t.me/CorvaxXRD" target="_blank" rel="noopener noreferrer" style={{ color: '#2196F3' }}>t.me/CorvaxXRD</a> to earn some TCorvax!
                   </li>
                 </ol>
               </div>

@@ -582,89 +582,174 @@ def fetch_xrd_balance(account_address):
         xrd_resource = 'resource_rdx1tknxxxxxxxxxradxrdxxxxxxxxx009923554798xxxxxxxxxradxrd'
         xrd_short_identifier = 'radxrd' # A unique identifier for XRD that's part of the address
         
-        # Use the Gateway API
-        url = "https://mainnet.radixdlt.com/state/entity/page/fungibles/"
-        print(f"Fetching XRD for {account_address} using Gateway API")
-        
-        # Prepare request payload
-        payload = {
-            "address": account_address,
-            "limit_per_page": 100  # Get a reasonable number of tokens
-        }
-        
-        # Set appropriate headers
+        # First get consistent ledger state
+        gateway_url = "https://mainnet.radixdlt.com"
         headers = {
             'Content-Type': 'application/json',
             'User-Agent': 'CorvaxLab Game/1.0'
         }
         
-        print(f"Making Gateway API request with payload: {json.dumps(payload)}")
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        status_response = requests.post(
+            f"{gateway_url}/status/current",
+            headers=headers,
+            json={},
+            timeout=15
+        )
         
-        print(f"Gateway API Response Status: {response.status_code}")
+        if status_response.status_code != 200:
+            print(f"Failed to get current ledger state: {status_response.text[:200]}")
+            return 0
+            
+        ledger_state = status_response.json().get("ledger_state")
+        
+        # Use the Gateway API entity/page/fungibles endpoint
+        print(f"Fetching XRD for {account_address} using Gateway API")
+        
+        # Prepare request payload
+        payload = {
+            "address": account_address,
+            "at_ledger_state": ledger_state,
+            "opt_ins": {
+                "fungibles": True
+            },
+            "limit_per_page": 100
+        }
+        
+        # Implement retry logic with exponential backoff
+        max_retries = 3
+        retry_delay = 1
+        
+        for retry in range(max_retries):
+            try:
+                response = requests.post(
+                    f"{gateway_url}/state/entity/page/fungibles/", 
+                    json=payload, 
+                    headers=headers, 
+                    timeout=15
+                )
+                
+                if response.status_code == 429:  # Rate limited
+                    if retry < max_retries - 1:
+                        sleep_time = retry_delay * (2 ** retry)
+                        print(f"Rate limited, retrying in {sleep_time} seconds...")
+                        time.sleep(sleep_time)
+                        continue
+                
+                break  # Success or non-retry error
+            except requests.exceptions.RequestException as e:
+                if retry < max_retries - 1:
+                    sleep_time = retry_delay * (2 ** retry)
+                    print(f"Request failed, retrying in {sleep_time} seconds: {e}")
+                    time.sleep(sleep_time)
+                else:
+                    raise
         
         if response.status_code != 200:
             print(f"Gateway API error: Status {response.status_code}")
             print(f"Response: {response.text[:200]}...")
-            # Try a second time before giving up
-            print("Retrying XRD balance check...")
-            time.sleep(2)  # Brief delay before retry
-            response = requests.post(url, json=payload, headers=headers, timeout=15)
-            if response.status_code != 200:
-                print(f"Retry failed with status: {response.status_code}")
-                return 0
+            return 0
         
         # Parse the JSON response
         data = response.json()
         
-        # Print debugging info
-        print(f"Gateway API total_count: {data.get('total_count', 0)}")
+        # Process all fungible resources across pages
+        xrd_balance = 0
+        fungible_items = data.get('items', [])
         
-        # Look for the XRD resource in the items
-        items = data.get('items', [])
-        print(f"Found {len(items)} resources in the account")
-        
-        # Print the first few resources to help diagnose issues
-        for i, item in enumerate(items[:5]):
-            resource_addr = item.get('resource_address', '')
-            amount = item.get('amount', '0')
-            print(f"Resource {i}: {resource_addr} = {amount}")
-        
-        # First try exact match
-        for item in items:
+        # First try exact match in the first page
+        for item in fungible_items:
             resource_addr = item.get('resource_address', '')
             amount = item.get('amount', '0')
             
             # Check if this is the XRD resource with exact match
             if resource_addr.lower() == xrd_resource.lower():
-                amount_value = float(amount)
-                print(f"FOUND XRD RESOURCE (exact match): {amount_value}")
-                return amount_value
+                xrd_balance = float(amount)
+                print(f"FOUND XRD RESOURCE (exact match): {xrd_balance}")
+                return xrd_balance
         
-        # If exact match fails, try a more flexible approach with the unique identifier
-        print("No exact match found for XRD, trying identifier match...")
-        for item in items:
+        # If exact match fails, try identifier match in the first page
+        for item in fungible_items:
             resource_addr = item.get('resource_address', '')
             amount = item.get('amount', '0')
             
-            # Check if this resource address contains the XRD identifier
+            # Check if resource address contains the XRD identifier
             if xrd_short_identifier in resource_addr.lower():
-                amount_value = float(amount)
-                print(f"FOUND XRD RESOURCE (identifier match): {amount_value}")
-                return amount_value
+                xrd_balance = float(amount)
+                print(f"FOUND XRD RESOURCE (identifier match): {xrd_balance}")
+                return xrd_balance
         
-        # Final fallback: check if there are additional pages of results
-        if 'next_cursor' in data and data.get('total_count', 0) > len(items):
-            print("Additional pages of tokens exist, but XRD not found in first page")
-            # In a full implementation, we would handle pagination here
+        # If not found in first page, check pagination
+        next_cursor = data.get('next_cursor')
+        
+        # If there's a next page, recursively check additional pages
+        while next_cursor:
+            payload['cursor'] = next_cursor
+            
+            # Implement retry for pagination requests
+            for retry in range(max_retries):
+                try:
+                    response = requests.post(
+                        f"{gateway_url}/state/entity/page/fungibles/", 
+                        json=payload, 
+                        headers=headers, 
+                        timeout=15
+                    )
+                    
+                    if response.status_code == 429:  # Rate limited
+                        if retry < max_retries - 1:
+                            sleep_time = retry_delay * (2 ** retry)
+                            print(f"Rate limited, retrying in {sleep_time} seconds...")
+                            time.sleep(sleep_time)
+                            continue
+                    
+                    break  # Success or non-retry error
+                except requests.exceptions.RequestException as e:
+                    if retry < max_retries - 1:
+                        sleep_time = retry_delay * (2 ** retry)
+                        print(f"Request failed, retrying in {sleep_time} seconds: {e}")
+                        time.sleep(sleep_time)
+                    else:
+                        raise
+            
+            if response.status_code != 200:
+                print(f"Gateway API error in pagination: Status {response.status_code}")
+                break
+                
+            data = response.json()
+            fungible_items = data.get('items', [])
+            
+            # Try exact match in this page
+            for item in fungible_items:
+                resource_addr = item.get('resource_address', '')
+                amount = item.get('amount', '0')
+                
+                if resource_addr.lower() == xrd_resource.lower():
+                    xrd_balance = float(amount)
+                    print(f"FOUND XRD RESOURCE (exact match in page): {xrd_balance}")
+                    return xrd_balance
+            
+            # Try identifier match in this page
+            for item in fungible_items:
+                resource_addr = item.get('resource_address', '')
+                amount = item.get('amount', '0')
+                
+                if xrd_short_identifier in resource_addr.lower():
+                    xrd_balance = float(amount)
+                    print(f"FOUND XRD RESOURCE (identifier match in page): {xrd_balance}")
+                    return xrd_balance
+            
+            # Get next cursor for pagination
+            next_cursor = data.get('next_cursor')
+            if not next_cursor:
+                break
         
         # If we get here, we didn't find XRD
         print("XRD not found in account fungible tokens")
         return 0
+        
     except Exception as e:
         print(f"Error fetching XRD with Gateway API: {e}")
         traceback.print_exc()
-        # Try an alternative approach or display an error rather than silent fail
         return 0
 
 def fetch_token_balance(account_address, token_symbol):
@@ -730,33 +815,58 @@ def fetch_token_balance(account_address, token_symbol):
 
 def fetch_user_nfts(account_address, resource_address=CREATURE_NFT_RESOURCE):
     """
-    Fetch all NFTs of a specific resource type for a user's account.
-    Returns: list of non-fungible IDs or empty list if none found
+    Fetch all NFTs of a specific resource type for a user's account with proper 
+    ledger state consistency and pagination handling.
     
-    - Better error handling
-    - Support for pagination
-    - More robust API interaction
+    Returns: list of non-fungible IDs or empty list if none found
     """
     if not account_address:
         print("No account address provided")
         return []
         
     try:
-        # Use the Gateway API to get all non-fungible tokens of this resource
-        url = "https://mainnet.radixdlt.com/state/entity/page/non-fungible-vaults/"
+        # Use consistent Gateway API URL
+        gateway_url = "https://mainnet.radixdlt.com"
+        
+        # First, get the current ledger state to maintain consistency across requests
+        status_url = f"{gateway_url}/status/current"
+        headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'CorvaxLab Game/1.0'
+        }
+        
+        status_response = requests.post(
+            status_url,
+            headers=headers,
+            json={},
+            timeout=15
+        )
+        
+        if status_response.status_code != 200:
+            print(f"Failed to get current ledger state: {status_response.text[:200]}")
+            return []
+            
+        # Extract the ledger state for consistency
+        ledger_state = status_response.json().get("ledger_state")
+        print(f"Using ledger state: {ledger_state}")
+        
+        # Use the entity/page/non-fungible-vaults endpoint with proper parameters
+        url = f"{gateway_url}/state/entity/page/non-fungible-vaults/"
         print(f"Fetching NFTs for {account_address} of resource {resource_address}")
         
         all_nft_ids = []
         next_cursor = None
         
-        # Implement pagination to get all NFTs
+        # Implement proper pagination loop
         while True:
-            # Prepare request payload
+            # Prepare request payload with correct opt-ins and ledger state
             payload = {
                 "address": account_address,
                 "resource_address": resource_address,
+                "at_ledger_state": ledger_state,  # Use consistent ledger state
                 "opt_ins": {
-                    "non_fungible_include_nfids": True
+                    "non_fungible_include_nfids": True,
+                    "ancestor_identities": True
                 },
                 "limit_per_page": 100
             }
@@ -765,14 +875,32 @@ def fetch_user_nfts(account_address, resource_address=CREATURE_NFT_RESOURCE):
             if next_cursor:
                 payload["cursor"] = next_cursor
             
-            # Set appropriate headers
-            headers = {
-                'Content-Type': 'application/json',
-                'User-Agent': 'CorvaxLab Game/1.0'
-            }
-            
             print(f"Making API request with payload: {json.dumps(payload)}")
-            response = requests.post(url, json=payload, headers=headers, timeout=15)
+            
+            # Implement retry logic with exponential backoff for rate limiting
+            max_retries = 3
+            retry_delay = 1
+            
+            for retry in range(max_retries):
+                try:
+                    response = requests.post(url, json=payload, headers=headers, timeout=15)
+                    
+                    # Check if we hit rate limiting
+                    if response.status_code == 429:
+                        if retry < max_retries - 1:
+                            sleep_time = retry_delay * (2 ** retry)
+                            print(f"Rate limited, retrying in {sleep_time} seconds...")
+                            time.sleep(sleep_time)
+                            continue
+                    
+                    break  # Success or non-retry error
+                except requests.exceptions.RequestException as e:
+                    if retry < max_retries - 1:
+                        sleep_time = retry_delay * (2 ** retry)
+                        print(f"Request failed, retrying in {sleep_time} seconds: {e}")
+                        time.sleep(sleep_time)
+                    else:
+                        raise
             
             if response.status_code != 200:
                 print(f"Gateway API error: Status {response.status_code}")
@@ -796,15 +924,16 @@ def fetch_user_nfts(account_address, resource_address=CREATURE_NFT_RESOURCE):
                 if vault_non_fungibles:
                     all_nft_ids.extend(vault_non_fungibles)
             
-            # Check if there are more pages
+            # Check if there are more pages with proper cursor handling
             next_cursor = data.get('next_cursor')
             if not next_cursor:
                 break
                 
-            print(f"Found {len(vault_non_fungibles)} NFTs, fetching next page...")
+            print(f"Found {len(vault_non_fungibles if 'vault_non_fungibles' in locals() else [])} NFTs, fetching next page with cursor: {next_cursor[:20]}...")
         
         print(f"Total NFTs found: {len(all_nft_ids)}")
         return all_nft_ids
+        
     except Exception as e:
         print(f"Error fetching NFTs with Gateway API: {e}")
         traceback.print_exc()
@@ -812,42 +941,78 @@ def fetch_user_nfts(account_address, resource_address=CREATURE_NFT_RESOURCE):
 
 def fetch_nft_data(resource_address, non_fungible_ids):
     """
-    Fetch data for specific non-fungible tokens.
-    Returns: dict of NFT ID to data or empty dict if none found
+    Fetch data for specific non-fungible tokens with proper 
+    error handling and batch processing.
     
-    - Better error handling
-    - Support for batching large requests
-    - More robust API interaction
+    Returns: dict of NFT ID to data or empty dict if none found
     """
     if not non_fungible_ids:
         return {}
         
     try:
-        # Use the Gateway API to get data for specific NFTs
-        url = "https://mainnet.radixdlt.com/state/non-fungible/data"
+        gateway_url = "https://mainnet.radixdlt.com"
+        url = f"{gateway_url}/state/non-fungible/data"
+        
         print(f"Fetching data for {len(non_fungible_ids)} NFTs of resource {resource_address}")
+        
+        # For consistency, first get current ledger state
+        headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'CorvaxLab Game/1.0'
+        }
+        
+        status_response = requests.post(
+            f"{gateway_url}/status/current",
+            headers=headers,
+            json={},
+            timeout=15
+        )
+        
+        if status_response.status_code != 200:
+            print(f"Failed to get current ledger state: {status_response.text[:200]}")
+            return {}
+            
+        ledger_state = status_response.json().get("ledger_state")
+        print(f"Using ledger state for NFT data: {ledger_state}")
         
         # Need to batch requests if we have more than 100 NFTs (API limit)
         all_nft_data = {}
-        batch_size = 100
+        batch_size = 100  # API limits to around 100 IDs per request
         
         for i in range(0, len(non_fungible_ids), batch_size):
             batch = non_fungible_ids[i:min(i+batch_size, len(non_fungible_ids))]
             print(f"Processing batch {i//batch_size + 1} with {len(batch)} NFTs")
             
-            # Prepare request payload
+            # Prepare request payload with ledger state for consistency
             payload = {
                 "resource_address": resource_address,
-                "non_fungible_ids": batch
+                "non_fungible_ids": batch,
+                "at_ledger_state": ledger_state
             }
             
-            # Set appropriate headers
-            headers = {
-                'Content-Type': 'application/json',
-                'User-Agent': 'CorvaxLab Game/1.0'
-            }
+            # Implement retry with exponential backoff
+            max_retries = 3
+            retry_delay = 1
             
-            response = requests.post(url, json=payload, headers=headers, timeout=20)  # Increased timeout
+            for retry in range(max_retries):
+                try:
+                    response = requests.post(url, json=payload, headers=headers, timeout=20)
+                    
+                    if response.status_code == 429:  # Rate limited
+                        if retry < max_retries - 1:
+                            sleep_time = retry_delay * (2 ** retry)
+                            print(f"Rate limited, retrying in {sleep_time} seconds...")
+                            time.sleep(sleep_time)
+                            continue
+                    
+                    break  # Success or non-retry error
+                except requests.exceptions.RequestException as e:
+                    if retry < max_retries - 1:
+                        sleep_time = retry_delay * (2 ** retry)
+                        print(f"Request failed, retrying in {sleep_time} seconds: {e}")
+                        time.sleep(sleep_time)
+                    else:
+                        raise
             
             if response.status_code != 200:
                 print(f"Gateway API error: Status {response.status_code}")
@@ -857,12 +1022,25 @@ def fetch_nft_data(resource_address, non_fungible_ids):
             # Parse the JSON response
             data = response.json()
             
-            # Get the NFT data
+            # Get the NFT data with proper structure handling
             non_fungible_items = data.get('non_fungible_ids', [])
             
             for nft_item in non_fungible_items:
                 nft_id = nft_item.get('non_fungible_id')
-                nft_data_value = nft_item.get('data', {}).get('programmatic_json')
+                
+                # Extract data with fallbacks for different data formats
+                nft_data_value = None
+                
+                if 'data' in nft_item:
+                    data_obj = nft_item.get('data', {})
+                    
+                    # Try programmatic_json first (most common format)
+                    if 'programmatic_json' in data_obj:
+                        nft_data_value = data_obj.get('programmatic_json')
+                    # Fallback to raw data if available
+                    elif 'raw' in data_obj:
+                        nft_data_value = data_obj.get('raw')
+                        
                 if nft_id and nft_data_value:
                     all_nft_data[nft_id] = nft_data_value
             
@@ -870,6 +1048,7 @@ def fetch_nft_data(resource_address, non_fungible_ids):
         
         print(f"Total NFTs data retrieved: {len(all_nft_data)}")
         return all_nft_data
+        
     except Exception as e:
         print(f"Error fetching NFT data with Gateway API: {e}")
         traceback.print_exc()
@@ -877,11 +1056,8 @@ def fetch_nft_data(resource_address, non_fungible_ids):
 
 def process_creature_data(nft_id, nft_data):
     """
-    Process raw creature NFT data into the expected format for the frontend.
-    
-    - Better error handling
-    - More comprehensive data processing
-    - Support for specialty stats
+    Process raw creature NFT data into the expected format for the frontend with
+    better error handling and data validation.
     """
     try:
         # Default values in case some fields are missing
@@ -923,6 +1099,14 @@ def process_creature_data(nft_id, nft_data):
         if not nft_data:
             return processed_data
             
+        # Handle different possible data structures
+        if isinstance(nft_data, str):
+            try:
+                # Sometimes the data may be a JSON string
+                nft_data = json.loads(nft_data)
+            except json.JSONDecodeError:
+                print(f"Could not parse NFT data as JSON: {nft_data[:100]}...")
+        
         # Species information
         if "species_id" in nft_data:
             species_id = nft_data["species_id"]
@@ -930,9 +1114,9 @@ def process_creature_data(nft_id, nft_data):
         
         # Get species information
         species_info = SPECIES_DATA.get(species_id, {"name": "Unknown", "preferred_token": "XRD", "rarity": "Common"})
-        processed_data["species_name"] = species_info["name"]
-        processed_data["rarity"] = species_info["rarity"]
-        processed_data["preferred_token"] = species_info["preferred_token"]
+        processed_data["species_name"] = species_info.get("name", "Unknown")
+        processed_data["rarity"] = species_info.get("rarity", "Common")
+        processed_data["preferred_token"] = species_info.get("preferred_token", "XRD")
         
         # Add specialty stats if available
         if "specialty_stats" in species_info:
@@ -942,6 +1126,8 @@ def process_creature_data(nft_id, nft_data):
         if "form" in nft_data:
             form = nft_data["form"]
             processed_data["form"] = form
+        else:
+            form = 0  # Default to egg form
         
         # Determine form name for display
         if form == 0:
@@ -969,7 +1155,7 @@ def process_creature_data(nft_id, nft_data):
         processed_data["key_image_url"] = image_url
         processed_data["image_url"] = image_url
         
-        # Stats
+        # Stats with proper type conversion
         if "stats" in nft_data:
             stats = nft_data["stats"]
             processed_data["stats"] = {
@@ -1013,18 +1199,18 @@ def process_creature_data(nft_id, nft_data):
                 processed_data["display_combination"] = f"Fusion Level {combination_level}"
                 
             # Bonus stats if available
-            if "bonus_stats" in nft_data:
+            if "bonus_stats" in nft_data and nft_data["bonus_stats"]:
                 bonus_stats = nft_data["bonus_stats"]
-                if bonus_stats:
-                    processed_data["bonus_stats"] = {k: int(v) for k, v in bonus_stats.items()}
+                processed_data["bonus_stats"] = {k: int(v) for k, v in bonus_stats.items()}
         
         # Generate display stats string
         stats_str = ", ".join([f"{stat.capitalize()}: {value}" for stat, value in processed_data["stats"].items()])
         processed_data["display_stats"] = stats_str
         
         return processed_data
+        
     except Exception as e:
-        print(f"Error processing creature data: {e}")
+        print(f"Error processing creature data for NFT {nft_id}: {e}")
         traceback.print_exc()
         return {
             "id": nft_id,
@@ -3903,12 +4089,8 @@ def check_creature_mint_status():
 @app.route("/api/getUserCreatures", methods=["GET", "POST"])
 def get_user_creatures():
     """
-    Improved API endpoint to get all creatures for a user.
-    
-    - Better error handling
-    - Support for both GET and POST requests
-    - More reliable account address determination
-    - Support for sorting and filtering
+    Improved API endpoint to get all creatures for a user with proper pagination
+    and data retrieval using the fixed helper functions.
     """
     try:
         if 'telegram_id' not in session:
@@ -3952,7 +4134,7 @@ def get_user_creatures():
             print(f"No Radix account address found for user {user_id}")
             return jsonify({"creatures": []})
         
-        # Fetch NFT IDs owned by this account
+        # Fetch NFT IDs owned by this account using the improved function
         print(f"Fetching creature NFTs for account: {account_address}")
         nft_ids = fetch_user_nfts(account_address, CREATURE_NFT_RESOURCE)
         
@@ -3962,22 +4144,18 @@ def get_user_creatures():
             
         print(f"Found {len(nft_ids)} creature NFTs for account {account_address}")
         
-        # Fetch NFT data for all IDs
-        # We may need to batch this if there are many NFTs
-        batch_size = 50  # Gateway API typically limits to 100, using 50 to be safe
-        all_creatures = []
+        # Fetch NFT data for all IDs using the improved function
+        nft_data_map = fetch_nft_data(CREATURE_NFT_RESOURCE, nft_ids)
         
-        for i in range(0, len(nft_ids), batch_size):
-            batch_ids = nft_ids[i:i+batch_size]
-            nft_data_map = fetch_nft_data(CREATURE_NFT_RESOURCE, batch_ids)
-            
-            if not nft_data_map:
-                continue
-                
-            # Process each creature's data
-            for nft_id, raw_data in nft_data_map.items():
-                processed_data = process_creature_data(nft_id, raw_data)
-                all_creatures.append(processed_data)
+        if not nft_data_map:
+            print("Could not retrieve NFT data")
+            return jsonify({"creatures": []})
+        
+        # Process each creature's data using the improved function
+        all_creatures = []
+        for nft_id, raw_data in nft_data_map.items():
+            processed_data = process_creature_data(nft_id, raw_data)
+            all_creatures.append(processed_data)
                 
         print(f"Processed {len(all_creatures)} creatures for account {account_address}")
         
@@ -3999,6 +4177,7 @@ def get_user_creatures():
         )
         
         return jsonify({"creatures": all_creatures})
+        
     except Exception as e:
         print(f"Error in get_user_creatures: {e}")
         traceback.print_exc()

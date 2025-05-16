@@ -849,111 +849,82 @@ def fetch_user_nfts(account_address, resource_address=CREATURE_NFT_RESOURCE, pag
         return []
 
 # FIXED: Updated fetch_nft_data function
+# UPDATED: fetch_nft_data function – no /status/ledger probe
 def fetch_nft_data(resource_address, nft_ids, page_limit=100):
     """
-    Fetch data for specific NFT IDs using the current Radix Gateway API spec (v1.10+).
-    Returns a dictionary mapping NFT IDs to their metadata.
+    Fetch on-chain metadata for the given NFT IDs.
+    Returns a dict { nft_id: metadata }.
     """
     if not nft_ids:
         return {}
-        
+
     try:
         gateway_url = "https://mainnet.radixdlt.com"
-        headers = {
+        headers     = {
             "Content-Type": "application/json",
-            "User-Agent": "CorvaxLab Game/1.1"
+            "User-Agent"  : "CorvaxLab Game/1.1"
         }
-        
-        # Get current ledger state for consistency
-        status_response = requests.post(
-            f"{gateway_url}/status/current",
-            headers=headers,
-            json={}
-        )
-        
-        if status_response.status_code != 200:
-            print(f"Failed to get current ledger state: {status_response.text[:200]}")
-            return {}
-            
-        ledger_state = status_response.json().get("ledger_state")
-        print(f"Using ledger state for NFT data: {ledger_state}")
-        
-        # Process NFT IDs in batches
+
+        # We don’t pin to a specific ledger state on this node
+        ledger_state = None
         all_nft_data = {}
-        
+
         for i in range(0, len(nft_ids), page_limit):
-            batch = nft_ids[i:min(i+page_limit, len(nft_ids))]
-            print(f"Processing batch {i//page_limit + 1} with {len(batch)} NFTs")
-            
-            body = {
+            batch = nft_ids[i:i + page_limit]
+            body  = {
                 "resource_address": resource_address,
-                "non_fungible_ids": batch,
-                "at_ledger_state": ledger_state
+                "non_fungible_ids": batch
             }
-            
-            # Implement retry with exponential backoff
+            if ledger_state:
+                body["at_ledger_state"] = ledger_state   # attach only if available
+
             max_retries = 3
             retry_delay = 1
-            
-            for retry in range(max_retries):
+            for attempt in range(max_retries):
                 try:
-                    response = requests.post(
+                    resp = requests.post(
                         f"{gateway_url}/state/non-fungible/data",
                         headers=headers,
                         json=body,
                         timeout=20
                     )
-                    
-                    if response.status_code == 429:  # Rate limited
-                        if retry < max_retries - 1:
-                            sleep_time = retry_delay * (2 ** retry)
-                            print(f"Rate limited, retrying in {sleep_time} seconds...")
-                            time.sleep(sleep_time)
-                            continue
-                    
-                    break  # Success or non-retry error
-                except requests.exceptions.RequestException as e:
-                    if retry < max_retries - 1:
-                        sleep_time = retry_delay * (2 ** retry)
-                        print(f"Request failed, retrying in {sleep_time} seconds: {e}")
-                        time.sleep(sleep_time)
+
+                    if resp.status_code == 429 and attempt < max_retries - 1:
+                        sleep_s = retry_delay * (2 ** attempt)
+                        print(f"[fetch_nft_data] 429 – retrying in {sleep_s}s")
+                        time.sleep(sleep_s)
+                        continue
+                    break
+                except requests.RequestException as e:
+                    if attempt < max_retries - 1:
+                        sleep_s = retry_delay * (2 ** attempt)
+                        print(f"[fetch_nft_data] network error {e} – retrying in {sleep_s}s")
+                        time.sleep(sleep_s)
                     else:
                         raise
-            
-            if response.status_code != 200:
-                print(f"Gateway API error: Status {response.status_code}")
-                print(f"Response: {response.text[:200]}...")
-                continue  # Try next batch instead of failing completely
-            
-            # Parse the JSON response
-            data = response.json()
-            
-            # NEW: Access the direct array in non_fungible_ids instead of items
+
+            if resp.status_code != 200:
+                print(f"[fetch_nft_data] Gateway error {resp.status_code}: {resp.text[:200]}")
+                continue
+
+            data = resp.json()
             for item in data.get("non_fungible_ids", []):
-                nft_id = item.get("non_fungible_id")
-                data_blob = item.get("data", {}) or {}
-                
-                # NEW: Get programmatic_json instead of raw_json
-                raw_data = data_blob.get("programmatic_json", {})
-                
-                # Optional: Flatten structure if your data is in fields
-                if raw_data.get("kind") == "Struct" and "fields" in raw_data:
-                    flattened_data = {}
-                    for field in raw_data.get("fields", []):
-                        field_name = field.get("field_name")
-                        field_value = field.get("value")
-                        if field_name:
-                            flattened_data[field_name] = field_value
-                    raw_data = flattened_data
-                
+                nft_id    = item.get("non_fungible_id")
+                data_blob = item.get("data") or {}
+                meta      = data_blob.get("programmatic_json", {})
+
+                # Flatten SBOR Structs for convenience
+                if meta.get("kind") == "Struct" and "fields" in meta:
+                    meta = {f.get("field_name"): f.get("value") for f in meta["fields"]}
+
                 if nft_id:
-                    all_nft_data[nft_id] = raw_data
-            
-        print(f"Total NFTs data retrieved: {len(all_nft_data)}")
+                    all_nft_data[nft_id] = meta
+
+        print(f"[fetch_nft_data] Retrieved {len(all_nft_data)} NFTs")
         return all_nft_data
-        
+
     except Exception as e:
-        print(f"Error fetching NFT data with Gateway API: {e}")
+        print(f"[fetch_nft_data] fatal error: {e}")
         traceback.print_exc()
         return {}
 
@@ -1121,180 +1092,101 @@ def process_creature_data(nft_id, nft_data):
         }
 
 # NEW: Added diagnostic endpoint for NFT fetch issues
+# NEW: Added diagnostic endpoint for NFT fetch issues
 @app.route("/api/diagnoseNftFetch", methods=["POST"])
 def diagnose_nft_fetch():
     """Diagnostic endpoint to help debug NFT fetching issues"""
     try:
         if 'telegram_id' not in session:
             return jsonify({"error": "Not logged in"}), 401
-            
+
         data = request.json or {}
-        account_address = data.get("accountAddress")
+        account_address  = data.get("accountAddress")
         resource_address = data.get("resourceAddress", CREATURE_NFT_RESOURCE)
-        
+
         if not account_address:
             return jsonify({"error": "No account address provided"}), 400
-            
+
         diagnostic_info = {
             "timestamp": time.time(),
             "account": account_address,
             "resource": resource_address,
             "steps": []
         }
-        
-        # Step 1: Check Gateway availability
+
+        # ────────────────────────────────────────────────────────────────
+        # STEP 1 - Gateway availability check (skipped on nodes that
+        #         don’t expose /status/ledger or /status/current).
+        # ────────────────────────────────────────────────────────────────
+        ledger_state = None               # we won’t pin to a state version
+        diagnostic_info["steps"].append({
+            "step"        : "Gateway availability check",
+            "status"      : "skipped",
+            "status_code" : 0,
+            "response"    : "endpoint not available on this node"
+        })
+        # ────────────────────────────────────────────────────────────────
+
+        # STEP 2: query NFIDs held by the account
         try:
-            gateway_url = "https://mainnet.radixdlt.com"
-            headers = {
-                "Content-Type": "application/json",
-                "User-Agent": "CorvaxLab Game/1.1"
-            }
-            
-            status_response = requests.post(
-                f"{gateway_url}/status/current",
-                headers=headers,
-                json={},
-                timeout=10
-            )
-            
+            nft_ids = get_account_nfids(account_address, resource_address)
+
             diagnostic_info["steps"].append({
-                "step": "Gateway availability check",
-                "status": "success" if status_response.status_code == 200 else "failed",
-                "status_code": status_response.status_code,
-                "response": status_response.json() if status_response.status_code == 200 else None
+                "step"      : "Get NFIDs with /state/entity/details",
+                "status"    : "success" if nft_ids else "no_ids_found",
+                "nft_count" : len(nft_ids),
+                "sample_ids": nft_ids[:5] if nft_ids else []
             })
-            
-            if status_response.status_code != 200:
-                return jsonify(diagnostic_info)
-                
-            ledger_state = status_response.json().get("ledger_state")
-                
-        except Exception as e:
-            diagnostic_info["steps"].append({
-                "step": "Gateway availability check",
-                "status": "error",
-                "error": str(e)
-            })
-            return jsonify(diagnostic_info)
-            
-        # Step 2: Find non-fungible vaults
-        try:
-            vault_response = requests.post(
-                f"{gateway_url}/state/entity/page/non-fungible-vaults/",
-                headers=headers,
-                json={
-                    "address": account_address,
-                    "resource_address": resource_address,
-                    "at_ledger_state": ledger_state,
-                    "limit_per_page": 10
-                },
-                timeout=15
-            )
-            
-            vault_data = vault_response.json() if vault_response.status_code == 200 else None
-            vault_items = vault_data.get("items", []) if vault_data else []
-            
-            diagnostic_info["steps"].append({
-                "step": "Find non-fungible vaults",
-                "status": "success" if vault_response.status_code == 200 else "failed",
-                "status_code": vault_response.status_code,
-                "vault_count": len(vault_items),
-                "has_next_cursor": "next_cursor" in vault_data if vault_data else False,
-                "sample_items": vault_items[:2] if vault_items else None
-            })
-            
-            if vault_response.status_code != 200 or not vault_items:
-                return jsonify(diagnostic_info)
-                
-        except Exception as e:
-            diagnostic_info["steps"].append({
-                "step": "Find non-fungible vaults",
-                "status": "error",
-                "error": str(e)
-            })
-            return jsonify(diagnostic_info)
-            
-        # Step 3: Get NFT IDs from first vault
-        try:
-            if vault_items:
-                first_vault = vault_items[0].get("vault_address")
-                
-                ids_response = requests.post(
-                    f"{gateway_url}/state/entity/page/non-fungible-vault/ids",
-                    headers=headers,
-                    json={
-                        "address": account_address,
-                        "resource_address": resource_address,
-                        "vault_address": first_vault,
-                        "at_ledger_state": ledger_state,
-                        "limit_per_page": 10
-                    },
-                    timeout=15
-                )
-                
-                ids_data = ids_response.json() if ids_response.status_code == 200 else None
-                nft_items = ids_data.get("items", []) if ids_data else []
-                
+
+            if nft_ids:
+                # STEP 3: fetch NFT data for a small sample
+                sample_ids = nft_ids[:2]
+                nft_data   = fetch_nft_data(resource_address, sample_ids)
+
                 diagnostic_info["steps"].append({
-                    "step": "Get NFT IDs from vault",
-                    "status": "success" if ids_response.status_code == 200 else "failed",
-                    "status_code": ids_response.status_code,
-                    "nft_count": len(nft_items),
-                    "has_next_cursor": "next_cursor" in ids_data if ids_data else False,
-                    "sample_items": nft_items[:2] if nft_items else None
+                    "step"       : "Get NFT data",
+                    "status"     : "success" if nft_data else "no_data_found",
+                    "data_count" : len(nft_data),
+                    "sample_data": {
+                        nid: {
+                            "structure": {k: type(v).__name__ for k, v in d.items()},
+                            "preview"  : {k: v for k, v in list(d.items())[:5]}
+                        } for nid, d in nft_data.items()
+                    } if nft_data else None
                 })
-                
-                if ids_response.status_code != 200 or not nft_items:
-                    return jsonify(diagnostic_info)
-                    
-                # Step 4: Get NFT data for one ID
-                try:
-                    if nft_items:
-                        first_nft_id = nft_items[0]  # directly use the ID string
-                        
-                        data_response = requests.post(
-                            f"{gateway_url}/state/non-fungible/data",
-                            headers=headers,
-                            json={
-                                "resource_address": resource_address,
-                                "non_fungible_ids": [first_nft_id],
-                                "at_ledger_state": ledger_state
-                            },
-                            timeout=15
-                        )
-                        
-                        data = data_response.json() if data_response.status_code == 200 else None
-                        
-                        diagnostic_info["steps"].append({
-                            "step": "Get NFT data",
-                            "status": "success" if data_response.status_code == 200 else "failed",
-                            "status_code": data_response.status_code,
-                            "response_structure": {k: type(v).__name__ for k, v in data.items()} if data else None,
-                            "sample_data": data
-                        })
-                except Exception as e:
+
+                # STEP 4: process one NFT
+                if nft_data:
+                    first_id   = next(iter(nft_data))
+                    processed  = process_creature_data(first_id, nft_data[first_id])
                     diagnostic_info["steps"].append({
-                        "step": "Get NFT data",
-                        "status": "error",
-                        "error": str(e)
+                        "step"          : "Process creature data",
+                        "status"        : "success",
+                        "processed_data": {
+                            "id"          : processed.get("id"),
+                            "species_name": processed.get("species_name"),
+                            "form"        : processed.get("form"),
+                            "rarity"      : processed.get("rarity")
+                        }
                     })
-                
         except Exception as e:
             diagnostic_info["steps"].append({
-                "step": "Get NFT IDs from vault",
+                "step"  : "Get NFIDs / Get NFT data",
                 "status": "error",
-                "error": str(e)
+                "error" : str(e)
             })
-            
+
+        # Always include API version info
+        diagnostic_info["api_version"] = {
+            "gateway_version": "v1.10+",
+            "client_version" : "1.2"
+        }
         return jsonify(diagnostic_info)
-        
+
     except Exception as e:
         print(f"Error in diagnose_nft_fetch: {e}")
         traceback.print_exc()
-        return jsonify({
-            "status": "error",
-            "error": str(e)
-        }), 500
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 # NEW: Added the missing API endpoint
 @app.route("/api/getCreatureNfts", methods=["GET", "POST"])

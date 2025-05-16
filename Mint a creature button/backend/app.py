@@ -582,174 +582,89 @@ def fetch_xrd_balance(account_address):
         xrd_resource = 'resource_rdx1tknxxxxxxxxxradxrdxxxxxxxxx009923554798xxxxxxxxxradxrd'
         xrd_short_identifier = 'radxrd' # A unique identifier for XRD that's part of the address
         
-        # First get consistent ledger state
-        gateway_url = "https://mainnet.radixdlt.com"
-        headers = {
-            'Content-Type': 'application/json',
-            'User-Agent': 'CorvaxLab Game/1.0'
-        }
-        
-        status_response = requests.post(
-            f"{gateway_url}/status/current",
-            headers=headers,
-            json={},
-            timeout=15
-        )
-        
-        if status_response.status_code != 200:
-            print(f"Failed to get current ledger state: {status_response.text[:200]}")
-            return 0
-            
-        ledger_state = status_response.json().get("ledger_state")
-        
-        # Use the Gateway API entity/page/fungibles endpoint
+        # Use the Gateway API
+        url = "https://mainnet.radixdlt.com/state/entity/page/fungibles/"
         print(f"Fetching XRD for {account_address} using Gateway API")
         
         # Prepare request payload
         payload = {
             "address": account_address,
-            "at_ledger_state": ledger_state,
-            "opt_ins": {
-                "fungibles": True
-            },
-            "limit_per_page": 100
+            "limit_per_page": 100  # Get a reasonable number of tokens
         }
         
-        # Implement retry logic with exponential backoff
-        max_retries = 3
-        retry_delay = 1
+        # Set appropriate headers
+        headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'CorvaxLab Game/1.0'
+        }
         
-        for retry in range(max_retries):
-            try:
-                response = requests.post(
-                    f"{gateway_url}/state/entity/page/fungibles/", 
-                    json=payload, 
-                    headers=headers, 
-                    timeout=15
-                )
-                
-                if response.status_code == 429:  # Rate limited
-                    if retry < max_retries - 1:
-                        sleep_time = retry_delay * (2 ** retry)
-                        print(f"Rate limited, retrying in {sleep_time} seconds...")
-                        time.sleep(sleep_time)
-                        continue
-                
-                break  # Success or non-retry error
-            except requests.exceptions.RequestException as e:
-                if retry < max_retries - 1:
-                    sleep_time = retry_delay * (2 ** retry)
-                    print(f"Request failed, retrying in {sleep_time} seconds: {e}")
-                    time.sleep(sleep_time)
-                else:
-                    raise
+        print(f"Making Gateway API request with payload: {json.dumps(payload)}")
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        
+        print(f"Gateway API Response Status: {response.status_code}")
         
         if response.status_code != 200:
             print(f"Gateway API error: Status {response.status_code}")
             print(f"Response: {response.text[:200]}...")
-            return 0
+            # Try a second time before giving up
+            print("Retrying XRD balance check...")
+            time.sleep(2)  # Brief delay before retry
+            response = requests.post(url, json=payload, headers=headers, timeout=15)
+            if response.status_code != 200:
+                print(f"Retry failed with status: {response.status_code}")
+                return 0
         
         # Parse the JSON response
         data = response.json()
         
-        # Process all fungible resources across pages
-        xrd_balance = 0
-        fungible_items = data.get('items', [])
+        # Print debugging info
+        print(f"Gateway API total_count: {data.get('total_count', 0)}")
         
-        # First try exact match in the first page
-        for item in fungible_items:
+        # Look for the XRD resource in the items
+        items = data.get('items', [])
+        print(f"Found {len(items)} resources in the account")
+        
+        # Print the first few resources to help diagnose issues
+        for i, item in enumerate(items[:5]):
+            resource_addr = item.get('resource_address', '')
+            amount = item.get('amount', '0')
+            print(f"Resource {i}: {resource_addr} = {amount}")
+        
+        # First try exact match
+        for item in items:
             resource_addr = item.get('resource_address', '')
             amount = item.get('amount', '0')
             
             # Check if this is the XRD resource with exact match
             if resource_addr.lower() == xrd_resource.lower():
-                xrd_balance = float(amount)
-                print(f"FOUND XRD RESOURCE (exact match): {xrd_balance}")
-                return xrd_balance
+                amount_value = float(amount)
+                print(f"FOUND XRD RESOURCE (exact match): {amount_value}")
+                return amount_value
         
-        # If exact match fails, try identifier match in the first page
-        for item in fungible_items:
+        # If exact match fails, try a more flexible approach with the unique identifier
+        print("No exact match found for XRD, trying identifier match...")
+        for item in items:
             resource_addr = item.get('resource_address', '')
             amount = item.get('amount', '0')
             
-            # Check if resource address contains the XRD identifier
+            # Check if this resource address contains the XRD identifier
             if xrd_short_identifier in resource_addr.lower():
-                xrd_balance = float(amount)
-                print(f"FOUND XRD RESOURCE (identifier match): {xrd_balance}")
-                return xrd_balance
+                amount_value = float(amount)
+                print(f"FOUND XRD RESOURCE (identifier match): {amount_value}")
+                return amount_value
         
-        # If not found in first page, check pagination
-        next_cursor = data.get('next_cursor')
-        
-        # If there's a next page, recursively check additional pages
-        while next_cursor:
-            payload['cursor'] = next_cursor
-            
-            # Implement retry for pagination requests
-            for retry in range(max_retries):
-                try:
-                    response = requests.post(
-                        f"{gateway_url}/state/entity/page/fungibles/", 
-                        json=payload, 
-                        headers=headers, 
-                        timeout=15
-                    )
-                    
-                    if response.status_code == 429:  # Rate limited
-                        if retry < max_retries - 1:
-                            sleep_time = retry_delay * (2 ** retry)
-                            print(f"Rate limited, retrying in {sleep_time} seconds...")
-                            time.sleep(sleep_time)
-                            continue
-                    
-                    break  # Success or non-retry error
-                except requests.exceptions.RequestException as e:
-                    if retry < max_retries - 1:
-                        sleep_time = retry_delay * (2 ** retry)
-                        print(f"Request failed, retrying in {sleep_time} seconds: {e}")
-                        time.sleep(sleep_time)
-                    else:
-                        raise
-            
-            if response.status_code != 200:
-                print(f"Gateway API error in pagination: Status {response.status_code}")
-                break
-                
-            data = response.json()
-            fungible_items = data.get('items', [])
-            
-            # Try exact match in this page
-            for item in fungible_items:
-                resource_addr = item.get('resource_address', '')
-                amount = item.get('amount', '0')
-                
-                if resource_addr.lower() == xrd_resource.lower():
-                    xrd_balance = float(amount)
-                    print(f"FOUND XRD RESOURCE (exact match in page): {xrd_balance}")
-                    return xrd_balance
-            
-            # Try identifier match in this page
-            for item in fungible_items:
-                resource_addr = item.get('resource_address', '')
-                amount = item.get('amount', '0')
-                
-                if xrd_short_identifier in resource_addr.lower():
-                    xrd_balance = float(amount)
-                    print(f"FOUND XRD RESOURCE (identifier match in page): {xrd_balance}")
-                    return xrd_balance
-            
-            # Get next cursor for pagination
-            next_cursor = data.get('next_cursor')
-            if not next_cursor:
-                break
+        # Final fallback: check if there are additional pages of results
+        if 'next_cursor' in data and data.get('total_count', 0) > len(items):
+            print("Additional pages of tokens exist, but XRD not found in first page")
+            # In a full implementation, we would handle pagination here
         
         # If we get here, we didn't find XRD
         print("XRD not found in account fungible tokens")
         return 0
-        
     except Exception as e:
         print(f"Error fetching XRD with Gateway API: {e}")
         traceback.print_exc()
+        # Try an alternative approach or display an error rather than silent fail
         return 0
 
 def fetch_token_balance(account_address, token_symbol):

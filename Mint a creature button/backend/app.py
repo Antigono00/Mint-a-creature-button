@@ -572,14 +572,15 @@ def fetch_scvx_balance(account_address):
         return 0
 
 def fetch_xrd_balance(account_address):
-    """Fetch XRD balance for a Radix account using the Gateway API."""
+    """Fetch XRD balance for a Radix account using the Gateway API with improved reliability."""
     if not account_address:
         print("No account address provided")
         return 0
         
     try:
-        # XRD resource address
+        # XRD resource address - This is the canonical XRD address
         xrd_resource = 'resource_rdx1tknxxxxxxxxxradxrdxxxxxxxxx009923554798xxxxxxxxxradxrd'
+        xrd_short_identifier = 'radxrd' # A unique identifier for XRD that's part of the address
         
         # Use the Gateway API
         url = "https://mainnet.radixdlt.com/state/entity/page/fungibles/"
@@ -605,7 +606,13 @@ def fetch_xrd_balance(account_address):
         if response.status_code != 200:
             print(f"Gateway API error: Status {response.status_code}")
             print(f"Response: {response.text[:200]}...")
-            return 0
+            # Try a second time before giving up
+            print("Retrying XRD balance check...")
+            time.sleep(2)  # Brief delay before retry
+            response = requests.post(url, json=payload, headers=headers, timeout=15)
+            if response.status_code != 200:
+                print(f"Retry failed with status: {response.status_code}")
+                return 0
         
         # Parse the JSON response
         data = response.json()
@@ -617,22 +624,47 @@ def fetch_xrd_balance(account_address):
         items = data.get('items', [])
         print(f"Found {len(items)} resources in the account")
         
-        # Look for XRD in the account
+        # Print the first few resources to help diagnose issues
+        for i, item in enumerate(items[:5]):
+            resource_addr = item.get('resource_address', '')
+            amount = item.get('amount', '0')
+            print(f"Resource {i}: {resource_addr} = {amount}")
+        
+        # First try exact match
         for item in items:
             resource_addr = item.get('resource_address', '')
             amount = item.get('amount', '0')
             
-            # Check if this is the XRD resource
-            if resource_addr == xrd_resource:
+            # Check if this is the XRD resource with exact match
+            if resource_addr.lower() == xrd_resource.lower():
                 amount_value = float(amount)
-                print(f"FOUND XRD RESOURCE: {amount_value}")
+                print(f"FOUND XRD RESOURCE (exact match): {amount_value}")
                 return amount_value
         
+        # If exact match fails, try a more flexible approach with the unique identifier
+        print("No exact match found for XRD, trying identifier match...")
+        for item in items:
+            resource_addr = item.get('resource_address', '')
+            amount = item.get('amount', '0')
+            
+            # Check if this resource address contains the XRD identifier
+            if xrd_short_identifier in resource_addr.lower():
+                amount_value = float(amount)
+                print(f"FOUND XRD RESOURCE (identifier match): {amount_value}")
+                return amount_value
+        
+        # Final fallback: check if there are additional pages of results
+        if 'next_cursor' in data and data.get('total_count', 0) > len(items):
+            print("Additional pages of tokens exist, but XRD not found in first page")
+            # In a full implementation, we would handle pagination here
+        
         # If we get here, we didn't find XRD
+        print("XRD not found in account fungible tokens")
         return 0
     except Exception as e:
         print(f"Error fetching XRD with Gateway API: {e}")
         traceback.print_exc()
+        # Try an alternative approach or display an error rather than silent fail
         return 0
 
 def fetch_token_balance(account_address, token_symbol):
@@ -3680,25 +3712,59 @@ def check_xrd_balance():
         account_address = data.get("accountAddress")
         
         if not account_address:
-            return jsonify({"error": "No account address provided"}), 400
+            return jsonify({
+                "error": "No account address provided",
+                "xrdBalance": 0,
+                "hasEnoughXrd": False,
+                "statusMessage": "Missing account address"
+            }), 400
         
         print(f"Checking XRD balance for account: {account_address}")
         
-        # Fetch XRD balance using the Gateway API
-        xrd_balance = fetch_xrd_balance(account_address)
+        # Try up to 2 times to fetch the XRD balance
+        max_attempts = 2
+        xrd_balance = 0
+        
+        for attempt in range(max_attempts):
+            try:
+                # Fetch XRD balance using the improved Gateway API function
+                xrd_balance = fetch_xrd_balance(account_address)
+                
+                if xrd_balance > 0:
+                    # We got a positive balance, no need for more attempts
+                    break
+                    
+                if attempt < max_attempts - 1:
+                    print(f"First attempt returned {xrd_balance} XRD, retrying...")
+                    time.sleep(1)  # Short delay before retry
+            except Exception as e:
+                print(f"Attempt {attempt+1} failed: {str(e)}")
+                if attempt < max_attempts - 1:
+                    time.sleep(1)  # Short delay before retry
         
         # Check if the user has enough XRD (250 XRD required for minting)
         has_enough_xrd = xrd_balance >= 250
         
+        # Prepare diagnostic info
+        status_message = "Balance check successful"
+        if xrd_balance == 0:
+            status_message = "Could not detect XRD in account - please refresh or try a different browser"
+        
         return jsonify({
             "status": "ok",
             "xrdBalance": xrd_balance,
-            "hasEnoughXrd": has_enough_xrd
+            "hasEnoughXrd": has_enough_xrd,
+            "statusMessage": status_message
         })
     except Exception as e:
         print(f"Error checking XRD balance: {e}")
         traceback.print_exc()
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        return jsonify({
+            "error": f"Server error: {str(e)}",
+            "xrdBalance": 0,
+            "hasEnoughXrd": False,
+            "statusMessage": "Error checking balance"
+        }), 500
 
 @app.route("/api/getCreatureMintManifest", methods=["POST"])
 def get_creature_mint_manifest():

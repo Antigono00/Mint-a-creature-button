@@ -299,6 +299,8 @@ SPECIES_DATA = {
     }
 }
 
+SPECIES_META = SPECIES_DATA   # ← legacy name used elsewhere
+
 def get_db_connection():
     conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -728,118 +730,190 @@ def fetch_token_balance(account_address, token_symbol):
         traceback.print_exc()
         return 0
 
-# FIXED: Updated fetch_user_nfts function
-def fetch_user_nfts(account_address, resource_address=CREATURE_NFT_RESOURCE, page_limit=100):
+# ──────────────────────────────────────────────────────────────
+# Helper: return list of NFIDs a given account owns for a resource
+# ──────────────────────────────────────────────────────────────
+def get_account_nfids(account, resource_address):
     """
-    Return all non-fungible IDs of `resource_address` owned by `account_address` (handles pagination).
-    Uses the current Radix Gateway API spec (v0.3+).
+    Uses /state/entity/details (Gateway ≥ v1.10) to list the non-fungible
+    IDs (“NFIDs”) of `resource_address` held in `account`.
+
+    Returns
+    -------
+    list[str]      a list of NFID strings, or [] if none / on error
+    """
+    try:
+        BASE = "https://mainnet.radixdlt.com"
+        HEADERS = {
+            "Content-Type": "application/json",
+            "User-Agent":  "CorvaxLab Game/1.2"
+        }
+        body = {
+            "addresses": [account],
+            "aggregation_level": "Vault",
+            "opt_ins": {"non_fungible_include_nfids": True}
+        }
+
+        # retry a couple of times for transient network/429 errors
+        for attempt in range(3):
+            try:
+                resp = requests.post(f"{BASE}/state/entity/details",
+                                     json=body,
+                                     headers=HEADERS,
+                                     timeout=15)
+                if resp.status_code == 429 and attempt < 2:
+                    time.sleep(1 + attempt)
+                    continue
+                break
+            except requests.RequestException:
+                if attempt < 2:
+                    time.sleep(1 + attempt)
+                    continue
+                raise
+
+        if resp.status_code != 200:
+            print(f"[get_account_nfids] gateway {resp.status_code}: "
+                  f"{resp.text[:120]}…")
+            return []
+
+        data = resp.json()
+        if not data.get("items"):
+            return []
+
+        # first (and only) entry corresponds to `account`
+        try:
+            for res in data["items"][0]["non_fungible_resources"]["items"]:
+                if res["resource_address"] == resource_address:
+                    # vaults.items[0].items -> list of NFIDs
+                    return res["vaults"]["items"][0]["items"]
+        except (KeyError, IndexError, TypeError):
+            pass
+
+        return []
+    except Exception as exc:
+        print(f"[get_account_nfids] fatal: {exc}")
+        traceback.print_exc()
+        return []
+
+
+def fetch_user_nfts(account_address, resource_address=CREATURE_NFT_RESOURCE):
+    """
+    Fetch all NFTs of a specific resource type for a user's account with proper 
+    ledger state consistency and pagination handling.
+    
+    Returns: list of non-fungible IDs or empty list if none found
     """
     if not account_address:
         print("No account address provided")
         return []
         
     try:
+        # Use consistent Gateway API URL
         gateway_url = "https://mainnet.radixdlt.com"
+        
+        # First, get the current ledger state to maintain consistency across requests
+        status_url = f"{gateway_url}/status/current"
         headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "CorvaxLab Game/1.1"
+            'Content-Type': 'application/json',
+            'User-Agent': 'CorvaxLab Game/1.0'
         }
         
-        # 1. Get current ledger state for consistency across requests
         status_response = requests.post(
-            f"{gateway_url}/status/current",
+            status_url,
             headers=headers,
-            json={}
+            json={},
+            timeout=15
         )
         
         if status_response.status_code != 200:
             print(f"Failed to get current ledger state: {status_response.text[:200]}")
             return []
             
+        # Extract the ledger state for consistency
         ledger_state = status_response.json().get("ledger_state")
         print(f"Using ledger state: {ledger_state}")
         
-        # 2. Get vault addresses (first step in 2-step process)
-        vaults = []
-        cursor = None
+        # Use the entity/page/non-fungible-vaults endpoint with proper parameters
+        url = f"{gateway_url}/state/entity/page/non-fungible-vaults/"
+        print(f"Fetching NFTs for {account_address} of resource {resource_address}")
         
+        all_nft_ids = []
+        next_cursor = None
+        
+        # Implement proper pagination loop
         while True:
-            body = {
+            # Prepare request payload with correct opt-ins and ledger state
+            payload = {
                 "address": account_address,
                 "resource_address": resource_address,
-                "at_ledger_state": ledger_state,
-                "limit_per_page": page_limit
+                "at_ledger_state": ledger_state,  # Use consistent ledger state
+                "opt_ins": {
+                    "non_fungible_include_nfids": True,
+                    "ancestor_identities": True
+                },
+                "limit_per_page": 100
             }
             
-            if cursor:
-                body["cursor"] = cursor
-                
-            response = requests.post(
-                f"{gateway_url}/state/entity/page/non-fungible-vaults/",
-                headers=headers,
-                json=body,
-                timeout=15
-            )
+            # Add cursor for pagination if we have one
+            if next_cursor:
+                payload["cursor"] = next_cursor
+            
+            print(f"Making API request with payload: {json.dumps(payload)}")
+            
+            # Implement retry logic with exponential backoff for rate limiting
+            max_retries = 3
+            retry_delay = 1
+            
+            for retry in range(max_retries):
+                try:
+                    response = requests.post(url, json=payload, headers=headers, timeout=15)
+                    
+                    # Check if we hit rate limiting
+                    if response.status_code == 429:
+                        if retry < max_retries - 1:
+                            sleep_time = retry_delay * (2 ** retry)
+                            print(f"Rate limited, retrying in {sleep_time} seconds...")
+                            time.sleep(sleep_time)
+                            continue
+                    
+                    break  # Success or non-retry error
+                except requests.exceptions.RequestException as e:
+                    if retry < max_retries - 1:
+                        sleep_time = retry_delay * (2 ** retry)
+                        print(f"Request failed, retrying in {sleep_time} seconds: {e}")
+                        time.sleep(sleep_time)
+                    else:
+                        raise
             
             if response.status_code != 200:
                 print(f"Gateway API error: Status {response.status_code}")
                 print(f"Response: {response.text[:200]}...")
+                return all_nft_ids  # Return what we have so far
+            
+            # Parse the JSON response
+            data = response.json()
+            
+            # Get the vault items
+            items = data.get('items', [])
+            
+            if not items:
+                print("No items returned from API")
                 break
                 
-            result = response.json()
-            items = result.get("items", [])
+            # Extract all NFT IDs from all vaults
+            for item in items:
+                vault_info = item.get('vault', {})
+                vault_non_fungibles = vault_info.get('non_fungible_ids', [])
+                if vault_non_fungibles:
+                    all_nft_ids.extend(vault_non_fungibles)
             
-            # Extract vault addresses
-            vaults.extend([item.get("vault_address") for item in items if item.get("vault_address")])
-            
-            # Check for cursor for next page
-            cursor = result.get("next_cursor")
-            if not cursor:
+            # Check if there are more pages with proper cursor handling
+            next_cursor = data.get('next_cursor')
+            if not next_cursor:
                 break
                 
-        print(f"Found {len(vaults)} vaults for resource {resource_address}")
+            print(f"Found {len(vault_non_fungibles if 'vault_non_fungibles' in locals() else [])} NFTs, fetching next page with cursor: {next_cursor[:20]}...")
         
-        # 3. Collect NFT IDs from every vault (second step)
-        all_nft_ids = []
-        
-        for vault in vaults:
-            cursor = None
-            
-            while True:
-                body = {
-                    "address": account_address,
-                    "resource_address": resource_address,
-                    "vault_address": vault,
-                    "at_ledger_state": ledger_state,
-                    "limit_per_page": page_limit
-                }
-                
-                if cursor:
-                    body["cursor"] = cursor
-                    
-                response = requests.post(
-                    f"{gateway_url}/state/entity/page/non-fungible-vault/ids",
-                    headers=headers,
-                    json=body,
-                    timeout=15
-                )
-                
-                if response.status_code != 200:
-                    print(f"Gateway API error for vault {vault}: Status {response.status_code}")
-                    print(f"Response: {response.text[:200]}...")
-                    break
-                    
-                result = response.json()
-                items = result.get("items", [])
-                
-                # Extract NFT IDs - Fixed: items are already the NFT IDs
-                all_nft_ids.extend(items)
-                
-                # Check for cursor for next page
-                cursor = result.get("next_cursor")
-                if not cursor:
-                    break
-                    
         print(f"Total NFTs found: {len(all_nft_ids)}")
         return all_nft_ids
         
@@ -848,475 +922,1231 @@ def fetch_user_nfts(account_address, resource_address=CREATURE_NFT_RESOURCE, pag
         traceback.print_exc()
         return []
 
-# FIXED: Updated fetch_nft_data function
-# UPDATED: fetch_nft_data function – no /status/ledger probe
-def fetch_nft_data(resource_address, nft_ids, page_limit=100):
+# ────────────────────────────────────────────────────────────
+# Helper: recursively unwrap Babylon programmatic JSON
+# ────────────────────────────────────────────────────────────
+import json
+import traceback
+from decimal import Decimal           # already imported once in your file
+# (leave the earlier import in place or deduplicate, it’s harmless)
+
+# ────────────────────────────────────────────────────────────
+# Helper: recursively unwrap Babylon programmatic JSON
+#          (PATCHED – tuple of named fields ⇒ dict)
+# ────────────────────────────────────────────────────────────
+from decimal import Decimal
+
+def _unwrap(val):
     """
-    Fetch on-chain metadata for the given NFT IDs.
-    Returns a dict { nft_id: metadata }.
+    Convert Radix Gateway programmatic_json to plain Python objects.
+
+    • Struct  → dict  {field_name: value, …}
+    • Tuple   → *if* its elements look like {field_name: …} records,
+                return the same dict; otherwise regular list
+    • Array   → list
+    • Enum    → unwrap & keep "variant" info if needed
+    • Decimal → Decimal()
+    • others  → primitive
+    """
+    if not isinstance(val, dict) or "kind" not in val:
+        return val                                # already plain
+
+    kind = val["kind"]
+
+    # ── Struct ───────────────────────────────────────────────
+    if kind == "Struct":
+        return {f["field_name"]: _unwrap(f["value"])
+                for f in val.get("fields", [])}
+
+    # ── Tuple (patched) ──────────────────────────────────────
+    if kind == "Tuple":
+        elems = val.get("elements") or val.get("fields") or []
+        # If every element has a `field_name`, treat as a record
+        if all(isinstance(e, dict) and "field_name" in e for e in elems):
+            return {e["field_name"]:
+                    _unwrap(e.get("value", e)) for e in elems}
+        # otherwise: anonymous tuple → list
+        return [_unwrap(e) for e in elems]
+
+    # ── Array ────────────────────────────────────────────────
+    if kind == "Array":
+        return [_unwrap(v) for v in val.get("elements", [])]
+
+    # ── Enum ─────────────────────────────────────────────────
+    # PATCH ‒ replace ONLY the Enum branch inside _unwrap
+    # ── Enum ─────────────────────────────────────────────────
+    if kind == "Enum":
+        variant = (val.get("name")          # old (<= v1.9)
+                   or val.get("variant_name")   # new (v1.10+)
+                   or val.get("variant")        # already-unwrapped
+                   or "Unknown")
+        fields  = val.get("fields") or []
+        if fields:                               # payload-carrying enum
+            inner = _unwrap(fields[0])
+            if isinstance(inner, dict):
+                inner["variant"] = variant
+                return inner
+            return {"variant": variant, "value": inner}
+        return variant                           # simple enum
+
+    # ── Decimal ──────────────────────────────────────────────
+    if kind == "Decimal":
+        return Decimal(val["value"])
+
+    # ── Fallback for primitive kinds ─────────────────────────
+    return val.get("value", val)
+
+
+# ──────────────────────────────────────────────────────────────
+# Main – convert on-chain CreatureData into front-end payload
+# ──────────────────────────────────────────────────────────────
+FORM_SUFFIX = {0: "_egg", 1: "_form1", 2: "_form2", 3: "_form3"}  # final
+
+def process_creature_data(nft_id: str, pj_raw) -> dict:
+    """
+    Take the unwrapped `programmatic_json` for a creature NFT and return the
+    JSON the React front-end expects.
+    """
+    # 1. normalise the raw blob -------------------------------------------------
+    if pj_raw is None:
+        pj = {}
+    elif isinstance(pj_raw, str):
+        try:
+            pj = json.loads(pj_raw)
+        except json.JSONDecodeError:
+            pj = {}
+    elif isinstance(pj_raw, list):             # Gateway sometimes wraps dict
+        pj = pj_raw[0] if pj_raw else {}
+    else:
+        pj = pj_raw
+    #pj = _lower_keys(pj)                       # no longer needed
+
+   # ── 2. species lookup ────────────────────────────────────────────────
+    raw_species_id = pj.get("species_id")
+
+    # if the NFT stores it as a string (most do) → turn into int first
+    try:
+        species_id = int(raw_species_id)
+    except (TypeError, ValueError):
+        species_id = None                       # fall through to name-match
+
+    if species_id is None:
+        # fallback: map by on-chain name field
+        species_id = next(
+            (sid for sid, v in SPECIES_DATA.items()
+             if v["name"].lower() == pj.get("species_name", "").lower()),
+            1                                    # default → Bullx
+        )
+
+    species_meta = SPECIES_DATA.get(species_id, SPECIES_DATA[1])
+
+    # ── 3. assemble the response ───────────────────────────────────────
+    form = pj.get("form", 0)
+    base_url = species_meta["base_url"]
+
+    def form_url(f: int) -> str:
+        return (
+            f"{base_url}_egg.png"   if f == 0 else
+            f"{base_url}_form1.png" if f == 1 else
+            f"{base_url}_form2.png" if f == 2 else
+            f"{base_url}_form3.png"
+        )
+
+    stats_raw = pj.get("stats", {}) or {}
+    stats = {
+        "energy":   int(stats_raw.get("energy",   5)),
+        "strength": int(stats_raw.get("strength", 5)),
+        "magic":    int(stats_raw.get("magic",    5)),
+        "stamina":  int(stats_raw.get("stamina",  5)),
+        "speed":    int(stats_raw.get("speed",    5)),
+    }
+
+    evo_raw = pj.get("evolution_progress", {}) or {}
+    evolution_progress = None if form == 3 else {
+        "stat_upgrades_completed": int(evo_raw.get("stat_upgrades_completed", 0)),
+        "total_points_allocated":  int(evo_raw.get("total_points_allocated",  0)),
+        "energy_allocated":        int(evo_raw.get("energy_allocated",        0)),
+        "strength_allocated":      int(evo_raw.get("strength_allocated",      0)),
+        "magic_allocated":         int(evo_raw.get("magic_allocated",         0)),
+        "stamina_allocated":       int(evo_raw.get("stamina_allocated",       0)),
+        "speed_allocated":         int(evo_raw.get("speed_allocated",         0)),
+    }
+
+    display_stats = ", ".join(f"{k.capitalize()}: {v}" for k, v in stats.items())
+
+    return {
+        "id": nft_id,
+
+        # <<< FIXED LINES >>>
+        "species_id":   species_id,           # ← use the **int**, not raw string
+        "species_name": species_meta["name"],
+
+        "form":            form,
+        "key_image_url":   pj.get("key_image_url") or form_url(form),
+        "image_url":       pj.get("image_url")     or form_url(form),
+
+        # <<< preferred_token now comes from the matched species >>>
+        "rarity":          pj.get("rarity")        or species_meta["rarity"],
+        "preferred_token": species_meta["preferred_token"],
+
+        "stats":              stats,
+        "evolution_progress": evolution_progress,
+        "final_form_upgrades": int(pj.get("final_form_upgrades", 0)),
+        "version":            int(pj.get("version", 1)),
+        "combination_level":  int(pj.get("combination_level", 0)),
+        "bonus_stats":        pj.get("bonus_stats") or {},
+        "display_form":       pj.get("display_form") or ("Egg" if form == 0 else f"Form {form}"),
+        "display_stats":      pj.get("display_stats") or display_stats,
+        "display_combination": pj.get("display_combination") or "",
+    }
+
+# ────────────────────────────────────────────────────────────
+# FINAL fetch_nft_data – now calls _unwrap on every NFT
+# ────────────────────────────────────────────────────────────
+def fetch_nft_data(resource_address: str,
+                   nft_ids: list[str],
+                   page_limit: int = 100) -> dict:
+    """
+    Return a dict {nfid: plain-python metadata} for every NFID.
+    Works on Babylon Gateway v1.10+.
     """
     if not nft_ids:
         return {}
 
-    try:
-        gateway_url = "https://mainnet.radixdlt.com"
-        headers     = {
-            "Content-Type": "application/json",
-            "User-Agent"  : "CorvaxLab Game/1.1"
+    BASE  = "https://mainnet.radixdlt.com"
+    HDRS  = {"Content-Type": "application/json",
+             "User-Agent":   "CorvaxLab Game/2.0"}
+
+    # 1. Use a single, pinned state_version (no epoch)
+    status = requests.post(f"{BASE}/status/gateway-status",
+                           json={}, headers=HDRS, timeout=10)
+    status.raise_for_status()
+    selector = {"state_version": status.json()["ledger_state"]["state_version"]}
+
+    out: dict[str, dict] = {}
+
+    for i in range(0, len(nft_ids), page_limit):
+        batch = nft_ids[i : i + page_limit]          # keep braces
+
+        body  = {
+            "at_ledger_state": selector,
+            "resource_address": resource_address,
+            "non_fungible_ids": batch                # ← plain strings
         }
 
-        # We don’t pin to a specific ledger state on this node
-        ledger_state = None
-        all_nft_data = {}
+        r = requests.post(f"{BASE}/state/non-fungible/data",
+                          json=body, headers=HDRS, timeout=20)
 
-        for i in range(0, len(nft_ids), page_limit):
-            batch = nft_ids[i:i + page_limit]
-            body  = {
-                "resource_address": resource_address,
-                "non_fungible_ids": batch
-            }
-            if ledger_state:
-                body["at_ledger_state"] = ledger_state   # attach only if available
+        if r.status_code == 400:                     # helpful debug
+            print("[fetch_nft_data] bad request:", r.text[:180])
+        r.raise_for_status()
 
-            max_retries = 3
-            retry_delay = 1
-            for attempt in range(max_retries):
-                try:
-                    resp = requests.post(
-                        f"{gateway_url}/state/non-fungible/data",
-                        headers=headers,
-                        json=body,
-                        timeout=20
-                    )
+        # Gateway echoes our list order
+        for entry in r.json().get("non_fungible_ids", []):
+            nfid   = entry["non_fungible_id"]        # with braces
+            raw    = (entry.get("data") or {}) \
+                       .get("programmatic_json", {})
 
-                    if resp.status_code == 429 and attempt < max_retries - 1:
-                        sleep_s = retry_delay * (2 ** attempt)
-                        print(f"[fetch_nft_data] 429 – retrying in {sleep_s}s")
-                        time.sleep(sleep_s)
-                        continue
-                    break
-                except requests.RequestException as e:
-                    if attempt < max_retries - 1:
-                        sleep_s = retry_delay * (2 ** attempt)
-                        print(f"[fetch_nft_data] network error {e} – retrying in {sleep_s}s")
-                        time.sleep(sleep_s)
-                    else:
-                        raise
+            out[nfid] = _unwrap(raw)                 # ← magic happens here
 
-            if resp.status_code != 200:
-                print(f"[fetch_nft_data] Gateway error {resp.status_code}: {resp.text[:200]}")
-                continue
+    print(f"[fetch_nft_data] Retrieved {len(out)}/{len(nft_ids)} NFTs")
+    return out
 
-            data = resp.json()
-            for item in data.get("non_fungible_ids", []):
-                nft_id    = item.get("non_fungible_id")
-                data_blob = item.get("data") or {}
-                meta      = data_blob.get("programmatic_json", {})
 
-                # Flatten SBOR Structs for convenience
-                if meta.get("kind") == "Struct" and "fields" in meta:
-                    meta = {f.get("field_name"): f.get("value") for f in meta["fields"]}
 
-                if nft_id:
-                    all_nft_data[nft_id] = meta
+import json
+import traceback
 
-        print(f"[fetch_nft_data] Retrieved {len(all_nft_data)} NFTs")
-        return all_nft_data
+# ──────────────────────────────────────────────────────────────
+# Helper:  build the image suffix for each form
+FORM_SUFFIX = {
+    0: "_egg",
+    1: "_form1",
+    2: "_form2",
+    3: "_form3",          # final form
+}
 
-    except Exception as e:
-        print(f"[fetch_nft_data] fatal error: {e}")
-        traceback.print_exc()
-        return {}
 
-def process_creature_data(nft_id, nft_data):
+def calculate_upgrade_cost(creature, energy=0, strength=0, magic=0, stamina=0, speed=0):
     """
-    Process raw creature NFT data into the expected format for the frontend.
-    Updated to handle current Radix Gateway API data format.
+    Calculate the cost for upgrading stats for a creature.
+    Returns: dict with token and amount
     """
     try:
-        # Default values in case some fields are missing
-        processed_data = {
-            "id": nft_id,
-            "species_id": 1,
-            "species_name": "Unknown",
-            "form": 0,
-            "key_image_url": "",
-            "image_url": "",
-            "rarity": "Common",
-            "stats": {
-                "energy": 5,
-                "strength": 5,
-                "magic": 5,
-                "stamina": 5,
-                "speed": 5
-            },
-            "evolution_progress": {
-                "stat_upgrades_completed": 0,
-                "total_points_allocated": 0,
-                "energy_allocated": 0,
-                "strength_allocated": 0,
-                "magic_allocated": 0,
-                "stamina_allocated": 0,
-                "speed_allocated": 0
-            },
-            "final_form_upgrades": 0,
-            "version": 1,
-            "combination_level": 0,
-            "bonus_stats": {},
-            "display_form": "Egg",
-            "display_stats": "",
-            "display_combination": "",
-            "preferred_token": "XRD"
-        }
-        
-        # Update with actual data if available
-        if not nft_data:
-            return processed_data
+        # First try to use the provided creature data
+        if creature:
+            # Get species info
+            species_id = creature.get("species_id", 1)
+            species_info = SPECIES_DATA.get(species_id, {})
             
-        # Handle different possible data structures
-        if isinstance(nft_data, str):
-            # Gateway already sends dict; fallback only for legacy cases
-            try:
-                nft_data = json.loads(nft_data)
-            except json.JSONDecodeError:
-                pass
-        
-        # Species information
-        species_id = nft_data.get("species_id", 1)
-        processed_data["species_id"] = species_id
-        
-        # Get species information
-        species_info = SPECIES_DATA.get(species_id, {"name": "Unknown", "preferred_token": "XRD", "rarity": "Common"})
-        processed_data["species_name"] = species_info.get("name", "Unknown")
-        processed_data["rarity"] = species_info.get("rarity", "Common")
-        processed_data["preferred_token"] = species_info.get("preferred_token", "XRD")
-        
-        # Add specialty stats if available
-        if "specialty_stats" in species_info:
-            processed_data["specialty_stats"] = species_info["specialty_stats"]
-        
-        # Form and image URL
-        form = nft_data.get("form", 0)
-        processed_data["form"] = form
-        
-        # Determine form name for display
-        if form == 0:
-            processed_data["display_form"] = "Egg"
-        elif form == 1:
-            processed_data["display_form"] = "Form 1"
-        elif form == 2:
-            processed_data["display_form"] = "Form 2"
-        elif form == 3:
-            processed_data["display_form"] = "Form 3 (Final)"
-        
-        # Generate image URLs based on form
-        base_url = species_info.get("base_url", "https://cvxlab.net/assets/evolving_creatures/bullx")
-        if form == 0:
-            image_url = f"{base_url}_egg.png"
-        elif form == 1:
-            image_url = f"{base_url}_form1.png"
-        elif form == 2:
-            image_url = f"{base_url}_form2.png"
-        elif form == 3:
-            image_url = f"{base_url}_form3.png"
-        else:
-            image_url = f"{base_url}_egg.png"
+            # Get preferred token
+            token_symbol = species_info.get("preferred_token", "XRD")
             
-        processed_data["key_image_url"] = image_url
-        processed_data["image_url"] = image_url
-        
-        # Stats with proper type conversion
-        if "stats" in nft_data:
-            stats = nft_data.get("stats", {})
-            processed_data["stats"] = {
-                "energy": int(stats.get("energy", 5)),
-                "strength": int(stats.get("strength", 5)),
-                "magic": int(stats.get("magic", 5)),
-                "stamina": int(stats.get("stamina", 5)),
-                "speed": int(stats.get("speed", 5))
-            }
-        
-        # Evolution progress
-        if "evolution_progress" in nft_data:
-            evolution_progress = nft_data.get("evolution_progress", {})
-            processed_data["evolution_progress"] = {
-                "stat_upgrades_completed": int(evolution_progress.get("stat_upgrades_completed", 0)),
-                "total_points_allocated": int(evolution_progress.get("total_points_allocated", 0)),
-                "energy_allocated": int(evolution_progress.get("energy_allocated", 0)),
-                "strength_allocated": int(evolution_progress.get("strength_allocated", 0)),
-                "magic_allocated": int(evolution_progress.get("magic_allocated", 0)),
-                "stamina_allocated": int(evolution_progress.get("stamina_allocated", 0)),
-                "speed_allocated": int(evolution_progress.get("speed_allocated", 0))
-            }
-        elif form == 3:
-            # Form 3 creatures don't have evolution progress
-            processed_data["evolution_progress"] = None
-        
-        # Final form upgrades
-        if "final_form_upgrades" in nft_data:
-            processed_data["final_form_upgrades"] = int(nft_data.get("final_form_upgrades", 0))
-        
-        # Version
-        if "version" in nft_data:
-            processed_data["version"] = int(nft_data.get("version", 1))
-        
-        # Combination level and bonus stats
-        if "combination_level" in nft_data:
-            combination_level = int(nft_data.get("combination_level", 0))
-            processed_data["combination_level"] = combination_level
+            # Get form
+            form = creature.get("form", 0)
             
-            if combination_level > 0:
-                processed_data["display_combination"] = f"Fusion Level {combination_level}"
+            # Default stat price if not specified
+            stat_price = species_info.get("stat_price", 50)
+            
+            # For final form (form 3), cost is stat_price * total points
+            if form == 3:
+                total_points = energy + strength + magic + stamina + speed
+                return {
+                    "token": token_symbol,
+                    "amount": stat_price * total_points
+                }
+            
+            # For forms 0-2, cost depends on which upgrade it is
+            evolution_progress = creature.get("evolution_progress", {})
+            if not evolution_progress:
+                return {
+                    "token": token_symbol,
+                    "amount": 0
+                }
                 
-            # Bonus stats if available
-            if "bonus_stats" in nft_data and nft_data["bonus_stats"]:
-                bonus_stats = nft_data.get("bonus_stats", {})
-                processed_data["bonus_stats"] = {k: int(v) for k, v in bonus_stats.items()}
-        
-        # Generate display stats string
-        stats_str = ", ".join([f"{stat.capitalize()}: {value}" for stat, value in processed_data["stats"].items()])
-        processed_data["display_stats"] = stats_str
-        
-        return processed_data
-        
+            upgrades_completed = evolution_progress.get("stat_upgrades_completed", 0)
+            
+            # Cost increases with each upgrade (10%, 20%, 30% of evolution price)
+            evolution_prices = species_info.get("evolution_prices", [50, 100, 200])
+            if form < len(evolution_prices):
+                evolution_price = evolution_prices[form]
+            else:
+                evolution_price = evolution_prices[-1]
+                
+            # Calculate percentage based on upgrade number
+            percentage = 0.1 * (upgrades_completed + 1)  # 0.1, 0.2, 0.3
+            upgrade_cost = evolution_price * percentage
+            
+            return {
+                "token": token_symbol,
+                "amount": upgrade_cost
+            }
+        else:
+            # If no creature data provided, we need to fetch it from the blockchain
+            # This should be rare since we typically have the creature data already
+            return {
+                "token": "XRD",  # Default to XRD
+                "amount": 100    # Default amount
+            }
     except Exception as e:
-        print(f"Error processing creature data for NFT {nft_id}: {e}")
+        print(f"Error calculating upgrade cost: {e}")
         traceback.print_exc()
         return {
-            "id": nft_id,
-            "species_name": "Error",
-            "form": 0,
-            "image_url": "https://cvxlab.net/assets/evolving_creatures/bullx_egg.png",
-            "rarity": "Common",
-            "error": str(e)
+            "token": "XRD",
+            "amount": 0
         }
 
-# NEW: Added diagnostic endpoint for NFT fetch issues
-# NEW: Added diagnostic endpoint for NFT fetch issues
-@app.route("/api/diagnoseNftFetch", methods=["POST"])
-def diagnose_nft_fetch():
-    """Diagnostic endpoint to help debug NFT fetching issues"""
+def calculate_evolution_cost(creature):
+    """
+    Calculate the cost for evolving a creature to the next form.
+    Returns: dict with token and amount
+    """
     try:
-        if 'telegram_id' not in session:
-            return jsonify({"error": "Not logged in"}), 401
-
-        data = request.json or {}
-        account_address  = data.get("accountAddress")
-        resource_address = data.get("resourceAddress", CREATURE_NFT_RESOURCE)
-
-        if not account_address:
-            return jsonify({"error": "No account address provided"}), 400
-
-        diagnostic_info = {
-            "timestamp": time.time(),
-            "account": account_address,
-            "resource": resource_address,
-            "steps": []
+        if not creature:
+            return {
+                "token": "XRD",
+                "amount": 0,
+                "can_evolve": False,
+                "reason": "Invalid creature data"
+            }
+            
+        # Get species info
+        species_id = creature.get("species_id", 1)
+        species_info = SPECIES_DATA.get(species_id, {})
+        
+        # Get preferred token
+        token_symbol = species_info.get("preferred_token", "XRD")
+        
+        # Get form
+        form = creature.get("form", 0)
+        
+        # Check if creature can evolve (must be form 0-2)
+        if form >= 3:
+            return {
+                "token": token_symbol,
+                "amount": 0,
+                "can_evolve": False,
+                "reason": "Already at max form"
+            }
+        
+        # Check if creature has completed 3 stat upgrades
+        evolution_progress = creature.get("evolution_progress", {})
+        if not evolution_progress:
+            return {
+                "token": token_symbol,
+                "amount": 0,
+                "can_evolve": False,
+                "reason": "No evolution progress data"
+            }
+                
+        upgrades_completed = evolution_progress.get("stat_upgrades_completed", 0)
+        if upgrades_completed < 3:
+            return {
+                "token": token_symbol,
+                "amount": 0,
+                "can_evolve": False,
+                "reason": f"Need 3 stat upgrades, only has {upgrades_completed}"
+            }
+        
+        # Get evolution price for current form
+        evolution_prices = species_info.get("evolution_prices", [50, 100, 200])
+        if form < len(evolution_prices):
+            evolution_price = evolution_prices[form]
+        else:
+            evolution_price = evolution_prices[-1]
+                
+        # Calculate total already paid in upgrades
+        # Typically 10% + 20% + 30% = 60% of full evolution price
+        paid_percentage = 0.6  # 0.1 + 0.2 + 0.3
+        remaining_cost = evolution_price * (1 - paid_percentage)
+        
+        return {
+            "token": token_symbol,
+            "amount": remaining_cost,
+            "can_evolve": True
         }
-
-        # ────────────────────────────────────────────────────────────────
-        # STEP 1 - Gateway availability check (skipped on nodes that
-        #         don’t expose /status/ledger or /status/current).
-        # ────────────────────────────────────────────────────────────────
-        ledger_state = None               # we won’t pin to a state version
-        diagnostic_info["steps"].append({
-            "step"        : "Gateway availability check",
-            "status"      : "skipped",
-            "status_code" : 0,
-            "response"    : "endpoint not available on this node"
-        })
-        # ────────────────────────────────────────────────────────────────
-
-        # STEP 2: query NFIDs held by the account
-        try:
-            nft_ids = get_account_nfids(account_address, resource_address)
-
-            diagnostic_info["steps"].append({
-                "step"      : "Get NFIDs with /state/entity/details",
-                "status"    : "success" if nft_ids else "no_ids_found",
-                "nft_count" : len(nft_ids),
-                "sample_ids": nft_ids[:5] if nft_ids else []
-            })
-
-            if nft_ids:
-                # STEP 3: fetch NFT data for a small sample
-                sample_ids = nft_ids[:2]
-                nft_data   = fetch_nft_data(resource_address, sample_ids)
-
-                diagnostic_info["steps"].append({
-                    "step"       : "Get NFT data",
-                    "status"     : "success" if nft_data else "no_data_found",
-                    "data_count" : len(nft_data),
-                    "sample_data": {
-                        nid: {
-                            "structure": {k: type(v).__name__ for k, v in d.items()},
-                            "preview"  : {k: v for k, v in list(d.items())[:5]}
-                        } for nid, d in nft_data.items()
-                    } if nft_data else None
-                })
-
-                # STEP 4: process one NFT
-                if nft_data:
-                    first_id   = next(iter(nft_data))
-                    processed  = process_creature_data(first_id, nft_data[first_id])
-                    diagnostic_info["steps"].append({
-                        "step"          : "Process creature data",
-                        "status"        : "success",
-                        "processed_data": {
-                            "id"          : processed.get("id"),
-                            "species_name": processed.get("species_name"),
-                            "form"        : processed.get("form"),
-                            "rarity"      : processed.get("rarity")
-                        }
-                    })
-        except Exception as e:
-            diagnostic_info["steps"].append({
-                "step"  : "Get NFIDs / Get NFT data",
-                "status": "error",
-                "error" : str(e)
-            })
-
-        # Always include API version info
-        diagnostic_info["api_version"] = {
-            "gateway_version": "v1.10+",
-            "client_version" : "1.2"
-        }
-        return jsonify(diagnostic_info)
-
     except Exception as e:
-        print(f"Error in diagnose_nft_fetch: {e}")
+        print(f"Error calculating evolution cost: {e}")
         traceback.print_exc()
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return {
+            "token": "XRD",
+            "amount": 0,
+            "can_evolve": False,
+            "reason": f"Error: {str(e)}"
+        }
 
-# NEW: Added the missing API endpoint
-@app.route("/api/getCreatureNfts", methods=["GET", "POST"])
-def get_creature_nfts():
-    """
-    Endpoint to get all creature NFTs for a user.
-    Supports either GET with query param or POST with JSON body for account_address.
-    """
+def can_build_fomo_hit(cur, user_id):
+    """Check if user has built and fully operational all other machine types."""
+    print(f"Checking FOMO HIT prerequisites for user_id: {user_id}")
     try:
-        if 'telegram_id' not in session:
-            return jsonify({"error": "Not logged in"}), 401
-            
-        user_id = session['telegram_id']
-        
-        # Try to get account_address from request (either POST body or GET query param)
-        account_address = None
-        
-        if request.method == "POST" and request.json:
-            account_address = request.json.get("accountAddress")
-            
-        elif request.args:
-            account_address = request.args.get("accountAddress")
-            
-        # If no account address in request, try to get from stored user data
-        if not account_address:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            
+        # 1. Check if they've built all required machine types
+        required_types = ['catLair', 'reactor', 'amplifier', 'incubator']
+        for machine_type in required_types:
             cur.execute("""
-                SELECT radix_account_address 
-                FROM users 
-                WHERE user_id=? AND radix_account_address IS NOT NULL
-            """, (user_id,))
-            
+                SELECT COUNT(*) as count FROM user_machines
+                WHERE user_id=? AND machine_type=?
+            """, (user_id, machine_type))
             row = cur.fetchone()
-            if row:
-                account_address = row['radix_account_address']
-                
-            cur.close()
-            conn.close()
-            
-        # If still no account address, return empty list
-        if not account_address:
-            print(f"No Radix account address found for user {user_id}")
-            return jsonify({"creatures": [], "tools": [], "spells": []})
-            
-        print(f"Fetching NFTs for account: {account_address}")
+            count = row[0] if row else 0
+            print(f"  Machine type {machine_type}: {count} found")
+            if count == 0:
+                print(f"  Missing required machine: {machine_type}")
+                return False
         
-        # Fetch creatures
-        creatures = []
-        try:
-            nft_ids = fetch_user_nfts(account_address, CREATURE_NFT_RESOURCE)
-            if nft_ids:
-                nft_data = fetch_nft_data(CREATURE_NFT_RESOURCE, nft_ids)
-                for nft_id, data in nft_data.items():
-                    creature = process_creature_data(nft_id, data)
-                    creatures.append(creature)
-        except Exception as e:
-            print(f"Error fetching creature NFTs: {e}")
-            traceback.print_exc()
+        # 2. For cat lairs and reactors, check ALL are at max level (3)
+        # First, get total count of each type
+        for machine_type in ['catLair', 'reactor']:
+            # Get total number of this machine type
+            cur.execute("""
+                SELECT COUNT(*) as total FROM user_machines
+                WHERE user_id=? AND machine_type=?
+            """, (user_id, machine_type))
+            total_row = cur.fetchone()
+            total = total_row[0] if total_row else 0
             
-        # Fetch tools
-        tools = []
-        try:
-            tool_ids = fetch_user_nfts(account_address, TOOL_NFT_RESOURCE)
-            if tool_ids:
-                tool_data = fetch_nft_data(TOOL_NFT_RESOURCE, tool_ids)
-                for tool_id, data in tool_data.items():
-                    tool = {
-                        "id": tool_id,
-                        "name": data.get("tool_name", "Unknown Tool"),
-                        "type": "tool",
-                        "tool_type": data.get("tool_type", "Unknown"),
-                        "tool_effect": data.get("tool_effect", ""),
-                        "image_url": data.get("key_image_url", "")
-                    }
-                    tools.append(tool)
-        except Exception as e:
-            print(f"Error fetching tool NFTs: {e}")
-            traceback.print_exc()
+            # Get how many are at max level
+            cur.execute("""
+                SELECT COUNT(*) as max_count FROM user_machines 
+                WHERE user_id=? AND machine_type=? AND level>=3
+            """, (user_id, machine_type))
+            max_row = cur.fetchone()
+            max_count = max_row[0] if max_row else 0
             
-        # Fetch spells
-        spells = []
-        try:
-            spell_ids = fetch_user_nfts(account_address, SPELL_NFT_RESOURCE)
-            if spell_ids:
-                spell_data = fetch_nft_data(SPELL_NFT_RESOURCE, spell_ids)
-                for spell_id, data in spell_data.items():
-                    spell = {
-                        "id": spell_id,
-                        "name": data.get("spell_name", "Unknown Spell"),
-                        "type": "spell", 
-                        "spell_type": data.get("spell_type", "Unknown"),
-                        "spell_effect": data.get("spell_effect", ""),
-                        "image_url": data.get("key_image_url", "")
-                    }
-                    spells.append(spell)
-        except Exception as e:
-            print(f"Error fetching spell NFTs: {e}")
-            traceback.print_exc()
+            print(f"  {machine_type}: {max_count}/{total} at max level")
             
-        # Sort creatures by rarity and form
-        def get_rarity_score(creature):
-            rarity = creature.get("rarity", "Common")
-            if rarity == "Legendary":
-                return 4
-            elif rarity == "Epic":
-                return 3
-            elif rarity == "Rare":
-                return 2
-            else:
-                return 1
-                
-        creatures.sort(
-            key=lambda c: (get_rarity_score(c), c.get("form", 0)), 
-            reverse=True
-        )
+            # For now, as long as one machine is at max level for each type, that counts as success
+            if max_count == 0:
+                print(f"  No {machine_type} machines at max level")
+                return False
         
-        print(f"Found {len(creatures)} creatures, {len(tools)} tools, {len(spells)} spells")
+        # 3. For amplifier, check it's at max level (5)
+        cur.execute("""
+            SELECT MAX(level) as max_level FROM user_machines
+            WHERE user_id=? AND machine_type='amplifier'
+        """, (user_id,))
+        max_level_row = cur.fetchone()
+        max_level = max_level_row[0] if max_level_row else 0
+        print(f"  Amplifier max level: {max_level}/5")
         
-        return jsonify({
-            "creatures": creatures,
-            "tools": tools,
-            "spells": spells
-        })
+        # For now, level 3 amplifier is ok as a prerequisite 
+        if max_level < 3:
+            print(f"  Amplifier not at required level")
+            return False
         
+        # 4. Check that incubator is operational (not offline)
+        cur.execute("""
+            SELECT is_offline FROM user_machines
+            WHERE user_id=? AND machine_type='incubator'
+            LIMIT 1
+        """, (user_id,))
+        row = cur.fetchone()
+        is_offline = row[0] if row else 1
+        print(f"  Incubator offline status: {is_offline}")
+        
+        # For testing, let's ignore the incubator online check
+        # Remove this if-statement in production
+        if is_offline == 1:
+            print(f"  Incubator is offline but we'll allow FOMO HIT for testing")
+            # return False  # Comment this out for easier testing
+            
+        print("✅ All FOMO HIT prerequisites met!")
+        return True
     except Exception as e:
-        print(f"Error in get_creature_nfts: {e}")
+        print(f"Error in can_build_fomo_hit: {e}")
+        import traceback
         traceback.print_exc()
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        return False
+
+def can_build_third_reactor(cur, user_id):
+    """Check if user can build a third reactor (has incubator and fomoHit)."""
+    try:
+        # Check if incubator exists
+        cur.execute("""
+            SELECT COUNT(*) FROM user_machines
+            WHERE user_id=? AND machine_type='incubator'
+        """, (user_id,))
+        has_incubator = cur.fetchone()[0] > 0
+        
+        # Check if fomoHit exists
+        cur.execute("""
+            SELECT COUNT(*) FROM user_machines
+            WHERE user_id=? AND machine_type='fomoHit'
+        """, (user_id,))
+        has_fomo_hit = cur.fetchone()[0] > 0
+        
+        # Count current reactors
+        cur.execute("""
+            SELECT COUNT(*) FROM user_machines
+            WHERE user_id=? AND machine_type='reactor'
+        """, (user_id,))
+        reactor_count = cur.fetchone()[0]
+        
+        # Can build third reactor if:
+        # 1. Has both incubator and fomoHit
+        # 2. Currently has 2 reactors (this would be the third)
+        return has_incubator and has_fomo_hit and reactor_count == 2
+    except Exception as e:
+        print(f"Error in can_build_third_reactor: {e}")
+        traceback.print_exc()
+        return False
+
+def create_nft_mint_manifest(account_address):
+    """Create the Radix transaction manifest for NFT minting."""
+    try:
+        # Generate a random ID for the NFT
+        nft_id = str(uuid.uuid4())[:8]
+        
+        # Simple manifest that calls a component to mint an NFT
+        # The component address should be your actual minting component
+        manifest = f"""
+CALL_METHOD
+    Address("component_rdx1cqpv4nfsgfk9c2r9ymnqyksfkjsg07mfc49m9qw3dpgzrmjmsuuquv")
+    "mint_user_nft"
+;
+CALL_METHOD
+    Address("{account_address}")
+    "try_deposit_batch_or_abort"
+    Expression("ENTIRE_WORKTOP")
+    None
+;
+"""
+        return manifest
+    except Exception as e:
+        print(f"Error creating NFT mint manifest: {e}")
+        traceback.print_exc()
+        return None
+
+def create_evolving_creature_manifest(account_address):
+    """Create the Radix transaction manifest for minting an evolving creature egg."""
+    try:
+        # XRD resource address
+        xrd_resource = "resource_rdx1tknxxxxxxxxxradxrdxxxxxxxxx009923554798xxxxxxxxxradxrd"
+        # Component address for the Evolving Creatures package
+        component_address = "component_rdx1cr5q55fea4v2yrn5gy3n9uag9ejw3gt2h5pg9tf8rn4egw9lnchx5d"
+        
+        # Create manifest to mint an egg
+        manifest = f"""
+CALL_METHOD
+    Address("{account_address}")
+    "withdraw"
+    Address("{xrd_resource}")
+    Decimal("250");
+TAKE_FROM_WORKTOP
+    Address("{xrd_resource}")
+    Decimal("250")
+    Bucket("payment");
+CALL_METHOD
+    Address("{component_address}")
+    "mint_egg"
+    Bucket("payment");
+CALL_METHOD
+    Address("{account_address}")
+    "try_deposit_batch_or_abort"
+    Expression("ENTIRE_WORKTOP")
+    None;
+"""
+        return manifest
+
+    except Exception as e:
+        print(f"Error creating evolving creature mint manifest: {e}")
+        traceback.print_exc()
+        return None
+
+def create_upgrade_stats_manifest(account_address, creature_id, energy=0, strength=0, magic=0, stamina=0, speed=0, token_resource=None, token_amount=0):
+    """
+    Create the Radix transaction manifest for upgrading stats of a creature.
+    
+    Parameters:
+    - account_address: The user's Radix account address
+    - creature_id: The ID of the creature NFT
+    - energy, strength, magic, stamina, speed: The stat points to allocate
+    - token_resource: The resource address of the payment token
+    - token_amount: The amount of tokens to pay
+    
+    Returns: The transaction manifest as a string
+    """
+    try:
+        # Use XRD as fallback if no token specified
+        if not token_resource:
+            token_resource = TOKEN_ADDRESSES["XRD"]
+            
+        # Create the manifest
+        manifest = f"""
+CALL_METHOD
+    Address("{account_address}") 
+    "withdraw_non_fungibles" 
+    Address("{CREATURE_NFT_RESOURCE}") 
+    Array<NonFungibleLocalId>(
+        NonFungibleLocalId("{creature_id}")
+    );
+TAKE_FROM_WORKTOP
+    Address("{CREATURE_NFT_RESOURCE}")
+    Decimal("1")
+    Bucket("nft");
+CALL_METHOD
+    Address("{account_address}") 
+    "withdraw" 
+    Address("{token_resource}") 
+    Decimal("{token_amount}");
+TAKE_FROM_WORKTOP
+    Address("{token_resource}")
+    Decimal("{token_amount}")
+    Bucket("payment");
+CALL_METHOD
+    Address("{EVOLVING_CREATURES_COMPONENT}")
+    "upgrade_stats"
+    Bucket("nft")
+    Bucket("payment")
+    {energy}u8     # Energy increase
+    {strength}u8   # Strength increase
+    {magic}u8      # Magic increase
+    {stamina}u8    # Stamina increase
+    {speed}u8;     # Speed increase
+CALL_METHOD
+    Address("{account_address}")
+    "deposit_batch"
+    Expression("ENTIRE_WORKTOP");
+"""
+        return manifest
+    except Exception as e:
+        print(f"Error creating upgrade stats manifest: {e}")
+        traceback.print_exc()
+        return None
+
+def create_evolve_manifest(account_address, creature_id, token_resource=None, token_amount=0):
+    """
+    Create the Radix transaction manifest for evolving a creature to the next form.
+    
+    Parameters:
+    - account_address: The user's Radix account address
+    - creature_id: The ID of the creature NFT
+    - token_resource: The resource address of the payment token
+    - token_amount: The amount of tokens to pay
+    
+    Returns: The transaction manifest as a string
+    """
+    try:
+        # Use XRD as fallback if no token specified
+        if not token_resource:
+            token_resource = TOKEN_ADDRESSES["XRD"]
+            
+        # Create the manifest
+        manifest = f"""
+CALL_METHOD
+    Address("{account_address}") 
+    "withdraw_non_fungibles" 
+    Address("{CREATURE_NFT_RESOURCE}") 
+    Array<NonFungibleLocalId>(
+        NonFungibleLocalId("{creature_id}")
+    );
+TAKE_FROM_WORKTOP
+    Address("{CREATURE_NFT_RESOURCE}")
+    Decimal("1")
+    Bucket("nft");
+CALL_METHOD
+    Address("{account_address}") 
+    "withdraw" 
+    Address("{token_resource}") 
+    Decimal("{token_amount}");
+TAKE_FROM_WORKTOP
+    Address("{token_resource}")
+    Decimal("{token_amount}")
+    Bucket("payment");
+CALL_METHOD
+    Address("{EVOLVING_CREATURES_COMPONENT}")
+    "evolve_to_next_form"
+    Bucket("nft")
+    Bucket("payment");
+CALL_METHOD
+    Address("{account_address}")
+    "deposit_batch"
+    Expression("ENTIRE_WORKTOP");
+"""
+        return manifest
+    except Exception as e:
+        print(f"Error creating evolve manifest: {e}")
+        traceback.print_exc()
+        return None
+
+def create_level_up_manifest(account_address, creature_id, energy=0, strength=0, magic=0, stamina=0, speed=0, token_resource=None, token_amount=0):
+    """
+    Create the Radix transaction manifest for leveling up stats of a form 3 creature.
+    
+    Parameters:
+    - account_address: The user's Radix account address
+    - creature_id: The ID of the creature NFT
+    - energy, strength, magic, stamina, speed: The stat points to allocate
+    - token_resource: The resource address of the payment token
+    - token_amount: The amount of tokens to pay
+    
+    Returns: The transaction manifest as a string
+    """
+    try:
+        # Use XRD as fallback if no token specified
+        if not token_resource:
+            token_resource = TOKEN_ADDRESSES["XRD"]
+            
+        # Create the manifest
+        manifest = f"""
+CALL_METHOD
+    Address("{account_address}") 
+    "withdraw_non_fungibles" 
+    Address("{CREATURE_NFT_RESOURCE}") 
+    Array<NonFungibleLocalId>(
+        NonFungibleLocalId("{creature_id}")
+    );
+TAKE_FROM_WORKTOP
+    Address("{CREATURE_NFT_RESOURCE}")
+    Decimal("1")
+    Bucket("nft");
+CALL_METHOD
+    Address("{account_address}") 
+    "withdraw" 
+    Address("{token_resource}") 
+    Decimal("{token_amount}");
+TAKE_FROM_WORKTOP
+    Address("{token_resource}")
+    Decimal("{token_amount}")
+    Bucket("payment");
+CALL_METHOD
+    Address("{EVOLVING_CREATURES_COMPONENT}")
+    "level_up_stats"
+    Bucket("nft")
+    Bucket("payment")
+    {energy}u8     # Energy increase
+    {strength}u8   # Strength increase
+    {magic}u8      # Magic increase
+    {stamina}u8    # Stamina increase
+    {speed}u8;     # Speed increase
+CALL_METHOD
+    Address("{account_address}")
+    "deposit_batch"
+    Expression("ENTIRE_WORKTOP");
+"""
+        return manifest
+    except Exception as e:
+        print(f"Error creating level up manifest: {e}")
+        traceback.print_exc()
+        return None
+
+def create_combine_creatures_manifest(account_address, creature_a_id, creature_b_id):
+    """
+    Create the Radix transaction manifest for combining two creatures.
+    
+    Parameters:
+    - account_address: The user's Radix account address
+    - creature_a_id: The ID of the primary creature NFT
+    - creature_b_id: The ID of the secondary creature NFT to be combined and burned
+    
+    Returns: The transaction manifest as a string
+    """
+    try:
+        # Create the manifest
+        manifest = f"""
+CALL_METHOD
+    Address("{account_address}") 
+    "withdraw_non_fungibles" 
+    Address("{CREATURE_NFT_RESOURCE}") 
+    Array<NonFungibleLocalId>(
+        NonFungibleLocalId("{creature_a_id}"),
+        NonFungibleLocalId("{creature_b_id}")
+    );
+TAKE_FROM_WORKTOP
+    Address("{CREATURE_NFT_RESOURCE}")
+    Decimal("1")
+    Bucket("creature_a");
+TAKE_FROM_WORKTOP
+    Address("{CREATURE_NFT_RESOURCE}")
+    Decimal("1")
+    Bucket("creature_b");
+CALL_METHOD
+    Address("{EVOLVING_CREATURES_COMPONENT}")
+    "combine_creatures"
+    Bucket("creature_a")
+    Bucket("creature_b");
+CALL_METHOD
+    Address("{account_address}")
+    "deposit_batch"
+    Expression("ENTIRE_WORKTOP");
+"""
+        return manifest
+    except Exception as e:
+        print(f"Error creating combine creatures manifest: {e}")
+        traceback.print_exc()
+        return None
+
+def create_buy_energy_manifest(account_address):
+    """Create the Radix transaction manifest for buying energy with CVX."""
+    try:
+        cvx_resource        = "resource_rdx1th04p2c55884yytgj0e8nq79ze9wjnvu4rpg9d7nh3t698cxdt0cr9"
+        destination_account = "account_rdx16ya2ncwya20j2w0k8d49us5ksvzepjhhh7cassx9jp9gz6hw69mhks"
+        cvx_amount          = "200.0"
+
+        manifest = f"""
+CALL_METHOD
+    Address("{account_address}")
+    "withdraw"
+    Address("{cvx_resource}")
+    Decimal("{cvx_amount}")
+;
+CALL_METHOD
+    Address("{destination_account}")
+    "try_deposit_batch_or_abort"
+    Expression("ENTIRE_WORKTOP")
+    None
+;
+"""
+        print(f"Generated manifest:\n{manifest}")
+        return manifest
+
+    except Exception as e:
+        print(f"Error creating energy purchase manifest: {e}")
+        traceback.print_exc()
+        return None
+
+def get_transaction_status(intent_hash):
+    """Check the status of a transaction using the Gateway API."""
+    try:
+        url = "https://mainnet.radixdlt.com/transaction/status"
+        payload = {"intent_hash": intent_hash}
+        headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'CorvaxLab Game/1.0'
+        }
+        
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        
+        if response.status_code != 200:
+            print(f"Gateway API error: Status {response.status_code}")
+            return {"status": "Unknown", "error": f"HTTP {response.status_code}"}
+        
+        data = response.json()
+        return {
+            "status": data.get("status", "Unknown"),
+            "intent_status": data.get("intent_status", "Unknown"),
+            "error_message": data.get("error_message", "")
+        }
+    except Exception as e:
+        print(f"Error checking transaction status: {e}")
+        traceback.print_exc()
+        return {"status": "Error", "error": str(e)}
+
+# Function to fetch NFT details from transaction
+def get_minted_nfts_from_transaction(intent_hash):
+    """
+    Get minted NFTs from a transaction using the Gateway API.
+    Returns: Tuple of (creature_nft, bonus_item) with complete data
+    """
+    try:
+        # NFT resource addresses
+        creature_resource = "resource_rdx1ntq7xkr0345fz8hkkappg2xsnepuj94a9wnu287km5tswu3323sjnl"
+        tool_resource = "resource_rdx1ntg0wsnuxq05z75f2jy7k20w72tgkt4crmdzcpyfvvgte3uvr9d5f0"
+        spell_resource = "resource_rdx1nfjm7ecgxk4m54pyy3mc75wgshh9usmyruy5rx7gkt3w2megc9s8jf"
+        
+        # Check if transaction is committed
+        status_data = get_transaction_status(intent_hash)
+        if status_data.get("status") != "CommittedSuccess":
+            print(f"Transaction not completed yet: {status_data}")
+            return None, None
+        
+        # Get transaction details
+        url = "https://mainnet.radixdlt.com/transaction/committed-details"
+        payload = {
+            "intent_hash": intent_hash,
+            "opt_ins": {
+                "balance_changes": True,
+                "non_fungible_changes": True
+            }
+        }
+        headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'CorvaxLab Game/1.0'
+        }
+        
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        
+        if response.status_code != 200:
+            print(f"Gateway API error: Status {response.status_code}")
+            return None, None
+        
+        data = response.json()
+        
+        # Extract NFT IDs from non-fungible changes
+        creature_nft = None
+        bonus_item = None
+        non_fungible_changes = data.get("non_fungible_changes", [])
+        
+        creature_id = None
+        bonus_item_id = None
+        bonus_item_type = None
+        
+        # First, find the NFT IDs
+        for change in non_fungible_changes:
+            resource_address = change.get("resource_address")
+            operation = change.get("operation")
+            
+            # Only look at deposit operations (NFTs being received)
+            if operation != "DEPOSIT":
+                continue
+                
+            if resource_address == creature_resource:
+                # This is a creature NFT
+                nft_ids = change.get("non_fungible_ids", [])
+                if nft_ids:
+                    creature_id = nft_ids[0]
+            
+            elif resource_address == tool_resource:
+                # This is a tool NFT
+                nft_ids = change.get("non_fungible_ids", [])
+                if nft_ids:
+                    bonus_item_id = nft_ids[0]
+                    bonus_item_type = "tool"
+                    
+            elif resource_address == spell_resource:
+                # This is a spell NFT
+                nft_ids = change.get("non_fungible_ids", [])
+                if nft_ids:
+                    bonus_item_id = nft_ids[0]
+                    bonus_item_type = "spell"
+        
+        # Now, fetch the actual NFT data for the creature
+        if creature_id:
+            creature_data = fetch_nft_data(creature_resource, [creature_id])
+            if creature_data and creature_id in creature_data:
+                raw_data = creature_data[creature_id]
+                creature_nft = process_creature_data(creature_id, raw_data)
+        
+        # Fetch the bonus item data
+        if bonus_item_id and bonus_item_type:
+            resource_address = tool_resource if bonus_item_type == "tool" else spell_resource
+            bonus_data = fetch_nft_data(resource_address, [bonus_item_id])
+            
+            if bonus_data and bonus_item_id in bonus_data:
+                raw_bonus_data = bonus_data[bonus_item_id]
+                
+                # Process tool or spell data
+                if bonus_item_type == "tool":
+                    image_url = raw_bonus_data.get("key_image_url", "")
+                    name = raw_bonus_data.get("tool_name", "Unknown Tool")
+                    tool_type = raw_bonus_data.get("tool_type", "")
+                    tool_effect = raw_bonus_data.get("tool_effect", "")
+                    
+                    bonus_item = {
+                        "id": bonus_item_id,
+                        "name": name,
+                        "type": "tool",
+                        "image_url": image_url,
+                        "tool_type": tool_type,
+                        "tool_effect": tool_effect
+                    }
+                else:  # spell
+                    image_url = raw_bonus_data.get("key_image_url", "")
+                    name = raw_bonus_data.get("spell_name", "Unknown Spell")
+                    spell_type = raw_bonus_data.get("spell_type", "")
+                    spell_effect = raw_bonus_data.get("spell_effect", "")
+                    
+                    bonus_item = {
+                        "id": bonus_item_id,
+                        "name": name,
+                        "type": "spell",
+                        "image_url": image_url,
+                        "spell_type": spell_type,
+                        "spell_effect": spell_effect
+                    }
+                
+        # If we couldn't get the actual data, create fallback data
+        if not creature_nft and creature_id:
+            creature_nft = {
+                "id": creature_id,
+                "species_name": "Random Creature",
+                "rarity": "Unknown",
+                "image_url": "https://cvxlab.net/assets/evolving_creatures/bullx_egg.png"
+            }
+            
+        if not bonus_item and bonus_item_id:
+            bonus_item = {
+                "id": bonus_item_id,
+                "name": f"Mystery {bonus_item_type.capitalize() if bonus_item_type else 'Item'}",
+                "type": bonus_item_type or "unknown",
+                "image_url": "https://cvxlab.net/assets/tools/babylon_keystone.png"
+            }
+            
+        return creature_nft, bonus_item
+    
+    except Exception as e:
+        print(f"Error getting minted NFTs: {e}")
+        traceback.print_exc()
+        return None, None
+
+def verify_telegram_login(query_dict, bot_token):
+    try:
+        their_hash = query_dict.pop("hash", None)
+        if not their_hash:
+            return False
+        secret_key = hashlib.sha256(bot_token.encode('utf-8')).digest()
+        sorted_kv = sorted(query_dict.items(), key=lambda x: x[0])
+        data_check_str = "\n".join([f"{k}={v}" for k, v in sorted_kv])
+        calc_hash_bytes = hmac.new(secret_key, data_check_str.encode('utf-8'), hashlib.sha256).hexdigest()
+        return calc_hash_bytes == their_hash
+    except Exception as e:
+        print(f"Error in verify_telegram_login: {e}")
+        traceback.print_exc()
+        return False
+
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve(path):
+    try:
+        if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+            return send_from_directory(app.static_folder, path)
+        else:
+            return send_from_directory(app.static_folder, 'index.html')
+    except Exception as e:
+        print(f"Error serving path {path}: {e}")
+        traceback.print_exc()
+        return "Server error", 500
+
+@app.route("/callback")
+def telegram_login_callback():
+    print("=== Telegram Callback Called ===")
+    try:
+        args = request.args.to_dict()
+        print(f"Args received: {args}")
+        
+        user_id = args.get("id")
+        tg_hash = args.get("hash")
+        auth_date = args.get("auth_date")
+        
+        if not user_id or not tg_hash or not auth_date:
+            print("Missing login data!")
+            return "<h3>Missing Telegram login data!</h3>", 400
+
+        if not verify_telegram_login(args, BOT_TOKEN):
+            print(f"Invalid hash! Data: {args}")
+            return "<h3>Invalid hash - data might be forged!</h3>", 403
+
+        print(f"Login successful for user {user_id}")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        try:
+            user_id_int = int(user_id)
+        except ValueError:
+            user_id_int = user_id
+
+        cursor.execute("SELECT corvax_count FROM users WHERE user_id=?", (user_id_int,))
+        row = cursor.fetchone()
+        if row is None:
+            first_name = args.get("first_name", "Unknown")
+            print(f"Creating new user: {first_name}")
+            cursor.execute(
+                "INSERT INTO users (user_id, first_name, corvax_count, seen_room_unlock) VALUES (?, ?, 0, 0)",
+                (user_id_int, first_name)
+            )
+            conn.commit()
+            
+            # Also create initial eggs resource for new user
+            cursor.execute(
+                "INSERT INTO resources (user_id, resource_name, amount) VALUES (?, 'eggs', 0)",
+                (user_id_int,)
+            )
+            conn.commit()
+
+        cursor.close()
+        conn.close()
+
+        session['telegram_id'] = str(user_id_int)
+        print(f"Session set, redirecting to homepage")
+        return redirect("https://cvxlab.net/")
+    except Exception as e:
+        print(f"Error in telegram_login_callback: {e}")
+        traceback.print_exc()
+        return "<h3>Server error</h3>", 500
+
+@app.route("/api/whoami")
+def whoami():
+    try:
+        print("=== WHOAMI CALLED ===")
+        if 'telegram_id' not in session:
+            print("User not logged in")
+            return jsonify({"loggedIn": False}), 200
+
+        user_id = session['telegram_id']
+        print(f"User logged in with ID: {user_id}")
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT first_name FROM users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if row:
+            return jsonify({"loggedIn": True, "firstName": row[0]})
+        else:
+            return jsonify({"loggedIn": True, "firstName": "Unknown"})
+    except Exception as e:
+        print(f"Error in whoami: {e}")
+        traceback.print_exc()
+        return jsonify({"error": "Server error"}), 500
+
+@app.route("/api/machines", methods=["GET"])
+def get_machines():
+    try:
+        if 'telegram_id' not in session:
+            return jsonify({"error": "Not logged in"}), 401
+
+        user_id = session['telegram_id']
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        try:
+            # Try with provisional_mint and room columns
+            cur.execute("""
+                SELECT id, machine_type, x, y, level, last_activated, is_offline, provisional_mint, room
+                FROM user_machines
+                WHERE user_id=?
+            """, (user_id,))
+            rows = cur.fetchall()
+            
+            machines = []
+            for r in rows:
+                machine = dict(r)
+                machines.append(machine)
+                
+        except sqlite3.OperationalError:
+            try:
+                # Try with provisional_mint only
+                cur.execute("""
+                    SELECT id, machine_type, x, y, level, last_activated, is_offline, provisional_mint
+                    FROM user_machines
+                    WHERE user_id=?
+                """, (user_id,))
+                rows = cur.fetchall()
+                
+                machines = []
+                for r in rows:
+                    machine = dict(r)
+                    machine["room"] = 1  # Default room
+                    machines.append(machine)
+            except sqlite3.OperationalError:
+                # Fall back to old schema without provisional_mint and room
+                cur.execute("""
+                    SELECT id, machine_type, x, y, level, last_activated, is_offline
+                    FROM user_machines
+                    WHERE user_id=?
+                """, (user_id,))
+                rows = cur.fetchall()
+                
+                machines = []
+                for r in rows:
+                    machine = dict(r)
+                    machine["provisionalMint"] = 0  # Default value
+                    machine["room"] = 1  # Default room
+                    machines.append(machine)
+
+        cur.close()
+        conn.close()
+
+        # Convert SQLite row objects to proper dictionaries for JSON
+        machine_list = []
+        for m in machines:
+            machine_dict = {
+                "id": m["id"],
+                "type": m["machine_type"],
+                "x": m["x"],
+                "y": m["y"],
+                "level": m["level"],
+                "lastActivated": m["last_activated"],
+                "isOffline": m["is_offline"],
+                "room": m.get("room", 1)  # Default to room 1 if not present
+            }
+            
+            if "provisional_mint" in m:
+                machine_dict["provisionalMint"] = m["provisional_mint"]
+            else:
+                machine_dict["provisionalMint"] = 0
+                
+            machine_list.append(machine_dict)
+
+        return jsonify(machine_list)
+    except Exception as e:
+        print(f"Error in get_machines: {e}")
+        traceback.print_exc()
+        return jsonify({"error": "Server error"}), 500
+
+@app.route("/api/resources", methods=["GET"])
+def get_resources():
+    try:
+        if 'telegram_id' not in session:
+            return jsonify({"error": "Not logged in"}), 401
+
+        user_id = session['telegram_id']
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        cur.execute("SELECT corvax_count FROM users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        tcorvax = row["corvax_count"] if row else 0
+
+        catNips = get_or_create_resource(cur, user_id, 'catNips')
+        energy = get_or_create_resource(cur, user_id, 'energy')
+        eggs = get_or_create_resource(cur, user_id, 'eggs')
+
+        cur.close()
+        conn.close()
+
+        return jsonify({
+            "tcorvax": float(tcorvax),
+            "catNips": float(catNips),
+            "energy": float(energy),
+            "eggs": float(eggs)
+        })
+    except Exception as e:
+        print(f"Error in get_resources: {e}")
+        traceback.print_exc()
+        return jsonify({"error": "Server error"}), 500
 
 def get_or_create_resource(cursor, user_id, resource_name):
     try:
@@ -1810,121 +2640,6 @@ def can_build_incubator(cur, user_id):
         traceback.print_exc()
         return False
 
-def can_build_fomo_hit(cur, user_id):
-    """Check if user has built and fully operational all other machine types."""
-    print(f"Checking FOMO HIT prerequisites for user_id: {user_id}")
-    try:
-        # 1. Check if they've built all required machine types
-        required_types = ['catLair', 'reactor', 'amplifier', 'incubator']
-        for machine_type in required_types:
-            cur.execute("""
-                SELECT COUNT(*) as count FROM user_machines
-                WHERE user_id=? AND machine_type=?
-            """, (user_id, machine_type))
-            row = cur.fetchone()
-            count = row[0] if row else 0
-            print(f"  Machine type {machine_type}: {count} found")
-            if count == 0:
-                print(f"  Missing required machine: {machine_type}")
-                return False
-        
-        # 2. For cat lairs and reactors, check ALL are at max level (3)
-        # First, get total count of each type
-        for machine_type in ['catLair', 'reactor']:
-            # Get total number of this machine type
-            cur.execute("""
-                SELECT COUNT(*) as total FROM user_machines
-                WHERE user_id=? AND machine_type=?
-            """, (user_id, machine_type))
-            total_row = cur.fetchone()
-            total = total_row[0] if total_row else 0
-            
-            # Get how many are at max level
-            cur.execute("""
-                SELECT COUNT(*) as max_count FROM user_machines 
-                WHERE user_id=? AND machine_type=? AND level>=3
-            """, (user_id, machine_type))
-            max_row = cur.fetchone()
-            max_count = max_row[0] if max_row else 0
-            
-            print(f"  {machine_type}: {max_count}/{total} at max level")
-            
-            # For now, as long as one machine is at max level for each type, that counts as success
-            if max_count == 0:
-                print(f"  No {machine_type} machines at max level")
-                return False
-        
-        # 3. For amplifier, check it's at max level (5)
-        cur.execute("""
-            SELECT MAX(level) as max_level FROM user_machines
-            WHERE user_id=? AND machine_type='amplifier'
-        """, (user_id,))
-        max_level_row = cur.fetchone()
-        max_level = max_level_row[0] if max_level_row else 0
-        print(f"  Amplifier max level: {max_level}/5")
-        
-        # For now, level 3 amplifier is ok as a prerequisite 
-        if max_level < 3:
-            print(f"  Amplifier not at required level")
-            return False
-        
-        # 4. Check that incubator is operational (not offline)
-        cur.execute("""
-            SELECT is_offline FROM user_machines
-            WHERE user_id=? AND machine_type='incubator'
-            LIMIT 1
-        """, (user_id,))
-        row = cur.fetchone()
-        is_offline = row[0] if row else 1
-        print(f"  Incubator offline status: {is_offline}")
-        
-        # For testing, let's ignore the incubator online check
-        # Remove this if-statement in production
-        if is_offline == 1:
-            print(f"  Incubator is offline but we'll allow FOMO HIT for testing")
-            # return False  # Comment this out for easier testing
-            
-        print("✅ All FOMO HIT prerequisites met!")
-        return True
-    except Exception as e:
-        print(f"Error in can_build_fomo_hit: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-def can_build_third_reactor(cur, user_id):
-    """Check if user can build a third reactor (has incubator and fomoHit)."""
-    try:
-        # Check if incubator exists
-        cur.execute("""
-            SELECT COUNT(*) FROM user_machines
-            WHERE user_id=? AND machine_type='incubator'
-        """, (user_id,))
-        has_incubator = cur.fetchone()[0] > 0
-        
-        # Check if fomoHit exists
-        cur.execute("""
-            SELECT COUNT(*) FROM user_machines
-            WHERE user_id=? AND machine_type='fomoHit'
-        """, (user_id,))
-        has_fomo_hit = cur.fetchone()[0] > 0
-        
-        # Count current reactors
-        cur.execute("""
-            SELECT COUNT(*) FROM user_machines
-            WHERE user_id=? AND machine_type='reactor'
-        """, (user_id,))
-        reactor_count = cur.fetchone()[0]
-        
-        # Can build third reactor if:
-        # 1. Has both incubator and fomoHit
-        # 2. Currently has 2 reactors (this would be the third)
-        return has_incubator and has_fomo_hit and reactor_count == 2
-    except Exception as e:
-        print(f"Error in can_build_third_reactor: {e}")
-        traceback.print_exc()
-        return False
-
 def upgrade_cost(cur, user_id, machine_type, current_level, machine_id):
     try:
         next_level = current_level + 1
@@ -2139,7 +2854,7 @@ def build_machine():
         has_room_column = True
         try:
             cur.execute("PRAGMA table_info(user_machines)")
-            columns = [column[1] for column in cur.fetchall()]
+            columns = [column[1] for column in cursor.fetchall()]
             has_provisional_mint = 'provisional_mint' in columns
             has_room_column = 'room' in columns
         except:
@@ -3169,723 +3884,7 @@ def sync_layout():
         traceback.print_exc() 
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
-def create_nft_mint_manifest(account_address):
-    """Create the Radix transaction manifest for NFT minting."""
-    try:
-        # Generate a random ID for the NFT
-        nft_id = str(uuid.uuid4())[:8]
-        
-        # Simple manifest that calls a component to mint an NFT
-        # The component address should be your actual minting component
-        manifest = f"""
-CALL_METHOD
-    Address("component_rdx1cqpv4nfsgfk9c2r9ymnqyksfkjsg07mfc49m9qw3dpgzrmjmsuuquv")
-    "mint_user_nft"
-;
-CALL_METHOD
-    Address("{account_address}")
-    "try_deposit_batch_or_abort"
-    Expression("ENTIRE_WORKTOP")
-    None
-;
-"""
-        return manifest
-    except Exception as e:
-        print(f"Error creating NFT mint manifest: {e}")
-        traceback.print_exc()
-        return None
-
-def create_evolving_creature_manifest(account_address):
-    """Create the Radix transaction manifest for minting an evolving creature egg."""
-    try:
-        # XRD resource address
-        xrd_resource = "resource_rdx1tknxxxxxxxxxradxrdxxxxxxxxx009923554798xxxxxxxxxradxrd"
-        # Component address for the Evolving Creatures package
-        component_address = "component_rdx1cr5q55fea4v2yrn5gy3n9uag9ejw3gt2h5pg9tf8rn4egw9lnchx5d"
-        
-        # Create manifest to mint an egg
-        manifest = f"""
-CALL_METHOD
-    Address("{account_address}")
-    "withdraw"
-    Address("{xrd_resource}")
-    Decimal("250");
-TAKE_FROM_WORKTOP
-    Address("{xrd_resource}")
-    Decimal("250")
-    Bucket("payment");
-CALL_METHOD
-    Address("{component_address}")
-    "mint_egg"
-    Bucket("payment");
-CALL_METHOD
-    Address("{account_address}")
-    "try_deposit_batch_or_abort"
-    Expression("ENTIRE_WORKTOP")
-    None;
-"""
-        return manifest
-
-    except Exception as e:
-        print(f"Error creating evolving creature mint manifest: {e}")
-        traceback.print_exc()
-        return None
-
-def create_upgrade_stats_manifest(account_address, creature_id, energy=0, strength=0, magic=0, stamina=0, speed=0, token_resource=None, token_amount=0):
-    """
-    Create the Radix transaction manifest for upgrading stats of a creature.
-    
-    Parameters:
-    - account_address: The user's Radix account address
-    - creature_id: The ID of the creature NFT
-    - energy, strength, magic, stamina, speed: The stat points to allocate
-    - token_resource: The resource address of the payment token
-    - token_amount: The amount of tokens to pay
-    
-    Returns: The transaction manifest as a string
-    """
-    try:
-        # Use XRD as fallback if no token specified
-        if not token_resource:
-            token_resource = TOKEN_ADDRESSES["XRD"]
-            
-        # Create the manifest
-        manifest = f"""
-CALL_METHOD
-    Address("{account_address}") 
-    "withdraw_non_fungibles" 
-    Address("{CREATURE_NFT_RESOURCE}") 
-    Array<NonFungibleLocalId>(
-        NonFungibleLocalId("{creature_id}")
-    );
-TAKE_FROM_WORKTOP
-    Address("{CREATURE_NFT_RESOURCE}")
-    Decimal("1")
-    Bucket("nft");
-CALL_METHOD
-    Address("{account_address}") 
-    "withdraw" 
-    Address("{token_resource}") 
-    Decimal("{token_amount}");
-TAKE_FROM_WORKTOP
-    Address("{token_resource}")
-    Decimal("{token_amount}")
-    Bucket("payment");
-CALL_METHOD
-    Address("{EVOLVING_CREATURES_COMPONENT}")
-    "upgrade_stats"
-    Bucket("nft")
-    Bucket("payment")
-    {energy}u8     # Energy increase
-    {strength}u8   # Strength increase
-    {magic}u8      # Magic increase
-    {stamina}u8    # Stamina increase
-    {speed}u8;     # Speed increase
-CALL_METHOD
-    Address("{account_address}")
-    "deposit_batch"
-    Expression("ENTIRE_WORKTOP");
-"""
-        return manifest
-    except Exception as e:
-        print(f"Error creating upgrade stats manifest: {e}")
-        traceback.print_exc()
-        return None
-
-def create_evolve_manifest(account_address, creature_id, token_resource=None, token_amount=0):
-    """
-    Create the Radix transaction manifest for evolving a creature to the next form.
-    
-    Parameters:
-    - account_address: The user's Radix account address
-    - creature_id: The ID of the creature NFT
-    - token_resource: The resource address of the payment token
-    - token_amount: The amount of tokens to pay
-    
-    Returns: The transaction manifest as a string
-    """
-    try:
-        # Use XRD as fallback if no token specified
-        if not token_resource:
-            token_resource = TOKEN_ADDRESSES["XRD"]
-            
-        # Create the manifest
-        manifest = f"""
-CALL_METHOD
-    Address("{account_address}") 
-    "withdraw_non_fungibles" 
-    Address("{CREATURE_NFT_RESOURCE}") 
-    Array<NonFungibleLocalId>(
-        NonFungibleLocalId("{creature_id}")
-    );
-TAKE_FROM_WORKTOP
-    Address("{CREATURE_NFT_RESOURCE}")
-    Decimal("1")
-    Bucket("nft");
-CALL_METHOD
-    Address("{account_address}") 
-    "withdraw" 
-    Address("{token_resource}") 
-    Decimal("{token_amount}");
-TAKE_FROM_WORKTOP
-    Address("{token_resource}")
-    Decimal("{token_amount}")
-    Bucket("payment");
-CALL_METHOD
-    Address("{EVOLVING_CREATURES_COMPONENT}")
-    "evolve_to_next_form"
-    Bucket("nft")
-    Bucket("payment");
-CALL_METHOD
-    Address("{account_address}")
-    "deposit_batch"
-    Expression("ENTIRE_WORKTOP");
-"""
-        return manifest
-    except Exception as e:
-        print(f"Error creating evolve manifest: {e}")
-        traceback.print_exc()
-        return None
-
-def create_level_up_manifest(account_address, creature_id, energy=0, strength=0, magic=0, stamina=0, speed=0, token_resource=None, token_amount=0):
-    """
-    Create the Radix transaction manifest for leveling up stats of a form 3 creature.
-    
-    Parameters:
-    - account_address: The user's Radix account address
-    - creature_id: The ID of the creature NFT
-    - energy, strength, magic, stamina, speed: The stat points to allocate
-    - token_resource: The resource address of the payment token
-    - token_amount: The amount of tokens to pay
-    
-    Returns: The transaction manifest as a string
-    """
-    try:
-        # Use XRD as fallback if no token specified
-        if not token_resource:
-            token_resource = TOKEN_ADDRESSES["XRD"]
-            
-        # Create the manifest
-        manifest = f"""
-CALL_METHOD
-    Address("{account_address}") 
-    "withdraw_non_fungibles" 
-    Address("{CREATURE_NFT_RESOURCE}") 
-    Array<NonFungibleLocalId>(
-        NonFungibleLocalId("{creature_id}")
-    );
-TAKE_FROM_WORKTOP
-    Address("{CREATURE_NFT_RESOURCE}")
-    Decimal("1")
-    Bucket("nft");
-CALL_METHOD
-    Address("{account_address}") 
-    "withdraw" 
-    Address("{token_resource}") 
-    Decimal("{token_amount}");
-TAKE_FROM_WORKTOP
-    Address("{token_resource}")
-    Decimal("{token_amount}")
-    Bucket("payment");
-CALL_METHOD
-    Address("{EVOLVING_CREATURES_COMPONENT}")
-    "level_up_stats"
-    Bucket("nft")
-    Bucket("payment")
-    {energy}u8     # Energy increase
-    {strength}u8   # Strength increase
-    {magic}u8      # Magic increase
-    {stamina}u8    # Stamina increase
-    {speed}u8;     # Speed increase
-CALL_METHOD
-    Address("{account_address}")
-    "deposit_batch"
-    Expression("ENTIRE_WORKTOP");
-"""
-        return manifest
-    except Exception as e:
-        print(f"Error creating level up manifest: {e}")
-        traceback.print_exc()
-        return None
-
-def create_combine_creatures_manifest(account_address, creature_a_id, creature_b_id):
-    """
-    Create the Radix transaction manifest for combining two creatures.
-    
-    Parameters:
-    - account_address: The user's Radix account address
-    - creature_a_id: The ID of the primary creature NFT
-    - creature_b_id: The ID of the secondary creature NFT to be combined and burned
-    
-    Returns: The transaction manifest as a string
-    """
-    try:
-        # Create the manifest
-        manifest = f"""
-CALL_METHOD
-    Address("{account_address}") 
-    "withdraw_non_fungibles" 
-    Address("{CREATURE_NFT_RESOURCE}") 
-    Array<NonFungibleLocalId>(
-        NonFungibleLocalId("{creature_a_id}"),
-        NonFungibleLocalId("{creature_b_id}")
-    );
-TAKE_FROM_WORKTOP
-    Address("{CREATURE_NFT_RESOURCE}")
-    Decimal("1")
-    Bucket("creature_a");
-TAKE_FROM_WORKTOP
-    Address("{CREATURE_NFT_RESOURCE}")
-    Decimal("1")
-    Bucket("creature_b");
-CALL_METHOD
-    Address("{EVOLVING_CREATURES_COMPONENT}")
-    "combine_creatures"
-    Bucket("creature_a")
-    Bucket("creature_b");
-CALL_METHOD
-    Address("{account_address}")
-    "deposit_batch"
-    Expression("ENTIRE_WORKTOP");
-"""
-        return manifest
-    except Exception as e:
-        print(f"Error creating combine creatures manifest: {e}")
-        traceback.print_exc()
-        return None
-
-def create_buy_energy_manifest(account_address):
-    """Create the Radix transaction manifest for buying energy with CVX."""
-    try:
-        cvx_resource        = "resource_rdx1th04p2c55884yytgj0e8nq79ze9wjnvu4rpg9d7nh3t698cxdt0cr9"
-        destination_account = "account_rdx16ya2ncwya20j2w0k8d49us5ksvzepjhhh7cassx9jp9gz6hw69mhks"
-        cvx_amount          = "200.0"
-
-        manifest = f"""
-CALL_METHOD
-    Address("{account_address}")
-    "withdraw"
-    Address("{cvx_resource}")
-    Decimal("{cvx_amount}")
-;
-CALL_METHOD
-    Address("{destination_account}")
-    "try_deposit_batch_or_abort"
-    Expression("ENTIRE_WORKTOP")
-    None
-;
-"""
-        print(f"Generated manifest:\n{manifest}")
-        return manifest
-
-    except Exception as e:
-        print(f"Error creating energy purchase manifest: {e}")
-        traceback.print_exc()
-        return None
-
-def get_transaction_status(intent_hash):
-    """Check the status of a transaction using the Gateway API."""
-    try:
-        url = "https://mainnet.radixdlt.com/transaction/status"
-        payload = {"intent_hash": intent_hash}
-        headers = {
-            'Content-Type': 'application/json',
-            'User-Agent': 'CorvaxLab Game/1.0'
-        }
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
-        
-        if response.status_code != 200:
-            print(f"Gateway API error: Status {response.status_code}")
-            return {"status": "Unknown", "error": f"HTTP {response.status_code}"}
-        
-        data = response.json()
-        return {
-            "status": data.get("status", "Unknown"),
-            "intent_status": data.get("intent_status", "Unknown"),
-            "error_message": data.get("error_message", "")
-        }
-    except Exception as e:
-        print(f"Error checking transaction status: {e}")
-        traceback.print_exc()
-        return {"status": "Error", "error": str(e)}
-
-# Function to fetch NFT details from transaction
-def get_minted_nfts_from_transaction(intent_hash):
-    """
-    Get minted NFTs from a transaction using the Gateway API.
-    Returns: Tuple of (creature_nft, bonus_item) with complete data
-    """
-    try:
-        # NFT resource addresses
-        creature_resource = "resource_rdx1ntq7xkr0345fz8hkkappg2xsnepuj94a9wnu287km5tswu3323sjnl"
-        tool_resource = "resource_rdx1ntg0wsnuxq05z75f2jy7k20w72tgkt4crmdzcpyfvvgte3uvr9d5f0"
-        spell_resource = "resource_rdx1nfjm7ecgxk4m54pyy3mc75wgshh9usmyruy5rx7gkt3w2megc9s8jf"
-        
-        # Check if transaction is committed
-        status_data = get_transaction_status(intent_hash)
-        if status_data.get("status") != "CommittedSuccess":
-            print(f"Transaction not completed yet: {status_data}")
-            return None, None
-        
-        # Get transaction details
-        url = "https://mainnet.radixdlt.com/transaction/committed-details"
-        payload = {
-            "intent_hash": intent_hash,
-            "opt_ins": {
-                "balance_changes": True,
-                "non_fungible_changes": True
-            }
-        }
-        headers = {
-            'Content-Type': 'application/json',
-            'User-Agent': 'CorvaxLab Game/1.0'
-        }
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
-        
-        if response.status_code != 200:
-            print(f"Gateway API error: Status {response.status_code}")
-            return None, None
-        
-        data = response.json()
-        
-        # Extract NFT IDs from non-fungible changes
-        creature_nft = None
-        bonus_item = None
-        non_fungible_changes = data.get("non_fungible_changes", [])
-        
-        creature_id = None
-        bonus_item_id = None
-        bonus_item_type = None
-        
-        # First, find the NFT IDs
-        for change in non_fungible_changes:
-            resource_address = change.get("resource_address")
-            operation = change.get("operation")
-            
-            # Only look at deposit operations (NFTs being received)
-            if operation != "DEPOSIT":
-                continue
-                
-            if resource_address == creature_resource:
-                # This is a creature NFT
-                nft_ids = change.get("non_fungible_ids", [])
-                if nft_ids:
-                    creature_id = nft_ids[0]
-            
-            elif resource_address == tool_resource:
-                # This is a tool NFT
-                nft_ids = change.get("non_fungible_ids", [])
-                if nft_ids:
-                    bonus_item_id = nft_ids[0]
-                    bonus_item_type = "tool"
-                    
-            elif resource_address == spell_resource:
-                # This is a spell NFT
-                nft_ids = change.get("non_fungible_ids", [])
-                if nft_ids:
-                    bonus_item_id = nft_ids[0]
-                    bonus_item_type = "spell"
-        
-        # Now, fetch the actual NFT data for the creature
-        if creature_id:
-            creature_data = fetch_nft_data(creature_resource, [creature_id])
-            if creature_data and creature_id in creature_data:
-                raw_data = creature_data[creature_id]
-                creature_nft = process_creature_data(creature_id, raw_data)
-        
-        # Fetch the bonus item data
-        if bonus_item_id and bonus_item_type:
-            resource_address = tool_resource if bonus_item_type == "tool" else spell_resource
-            bonus_data = fetch_nft_data(resource_address, [bonus_item_id])
-            
-            if bonus_data and bonus_item_id in bonus_data:
-                raw_bonus_data = bonus_data[bonus_item_id]
-                
-                # Process tool or spell data
-                if bonus_item_type == "tool":
-                    image_url = raw_bonus_data.get("key_image_url", "")
-                    name = raw_bonus_data.get("tool_name", "Unknown Tool")
-                    tool_type = raw_bonus_data.get("tool_type", "")
-                    tool_effect = raw_bonus_data.get("tool_effect", "")
-                    
-                    bonus_item = {
-                        "id": bonus_item_id,
-                        "name": name,
-                        "type": "tool",
-                        "image_url": image_url,
-                        "tool_type": tool_type,
-                        "tool_effect": tool_effect
-                    }
-                else:  # spell
-                    image_url = raw_bonus_data.get("key_image_url", "")
-                    name = raw_bonus_data.get("spell_name", "Unknown Spell")
-                    spell_type = raw_bonus_data.get("spell_type", "")
-                    spell_effect = raw_bonus_data.get("spell_effect", "")
-                    
-                    bonus_item = {
-                        "id": bonus_item_id,
-                        "name": name,
-                        "type": "spell",
-                        "image_url": image_url,
-                        "spell_type": spell_type,
-                        "spell_effect": spell_effect
-                    }
-                
-        # If we couldn't get the actual data, create fallback data
-        if not creature_nft and creature_id:
-            creature_nft = {
-                "id": creature_id,
-                "species_name": "Random Creature",
-                "rarity": "Unknown",
-                "image_url": "https://cvxlab.net/assets/evolving_creatures/bullx_egg.png"
-            }
-            
-        if not bonus_item and bonus_item_id:
-            bonus_item = {
-                "id": bonus_item_id,
-                "name": f"Mystery {bonus_item_type.capitalize() if bonus_item_type else 'Item'}",
-                "type": bonus_item_type or "unknown",
-                "image_url": "https://cvxlab.net/assets/tools/babylon_keystone.png"
-            }
-            
-        return creature_nft, bonus_item
-    
-    except Exception as e:
-        print(f"Error getting minted NFTs: {e}")
-        traceback.print_exc()
-        return None, None
-
-def verify_telegram_login(query_dict, bot_token):
-    try:
-        their_hash = query_dict.pop("hash", None)
-        if not their_hash:
-            return False
-        secret_key = hashlib.sha256(bot_token.encode('utf-8')).digest()
-        sorted_kv = sorted(query_dict.items(), key=lambda x: x[0])
-        data_check_str = "\n".join([f"{k}={v}" for k, v in sorted_kv])
-        calc_hash_bytes = hmac.new(secret_key, data_check_str.encode('utf-8'), hashlib.sha256).hexdigest()
-        return calc_hash_bytes == their_hash
-    except Exception as e:
-        print(f"Error in verify_telegram_login: {e}")
-        traceback.print_exc()
-        return False
-
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def serve(path):
-    try:
-        if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
-            return send_from_directory(app.static_folder, path)
-        else:
-            return send_from_directory(app.static_folder, 'index.html')
-    except Exception as e:
-        print(f"Error serving path {path}: {e}")
-        traceback.print_exc()
-        return "Server error", 500
-
-@app.route("/callback")
-def telegram_login_callback():
-    print("=== Telegram Callback Called ===")
-    try:
-        args = request.args.to_dict()
-        print(f"Args received: {args}")
-        
-        user_id = args.get("id")
-        tg_hash = args.get("hash")
-        auth_date = args.get("auth_date")
-        
-        if not user_id or not tg_hash or not auth_date:
-            print("Missing login data!")
-            return "<h3>Missing Telegram login data!</h3>", 400
-
-        if not verify_telegram_login(args, BOT_TOKEN):
-            print(f"Invalid hash! Data: {args}")
-            return "<h3>Invalid hash - data might be forged!</h3>", 403
-
-        print(f"Login successful for user {user_id}")
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        try:
-            user_id_int = int(user_id)
-        except ValueError:
-            user_id_int = user_id
-
-        cursor.execute("SELECT corvax_count FROM users WHERE user_id=?", (user_id_int,))
-        row = cursor.fetchone()
-        if row is None:
-            first_name = args.get("first_name", "Unknown")
-            print(f"Creating new user: {first_name}")
-            cursor.execute(
-                "INSERT INTO users (user_id, first_name, corvax_count, seen_room_unlock) VALUES (?, ?, 0, 0)",
-                (user_id_int, first_name)
-            )
-            conn.commit()
-            
-            # Also create initial eggs resource for new user
-            cursor.execute(
-                "INSERT INTO resources (user_id, resource_name, amount) VALUES (?, 'eggs', 0)",
-                (user_id_int,)
-            )
-            conn.commit()
-
-        cursor.close()
-        conn.close()
-
-        session['telegram_id'] = str(user_id_int)
-        print(f"Session set, redirecting to homepage")
-        return redirect("https://cvxlab.net/")
-    except Exception as e:
-        print(f"Error in telegram_login_callback: {e}")
-        traceback.print_exc()
-        return "<h3>Server error</h3>", 500
-
-@app.route("/api/whoami")
-def whoami():
-    try:
-        print("=== WHOAMI CALLED ===")
-        if 'telegram_id' not in session:
-            print("User not logged in")
-            return jsonify({"loggedIn": False}), 200
-
-        user_id = session['telegram_id']
-        print(f"User logged in with ID: {user_id}")
-        
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT first_name FROM users WHERE user_id=?", (user_id,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-
-        if row:
-            return jsonify({"loggedIn": True, "firstName": row[0]})
-        else:
-            return jsonify({"loggedIn": True, "firstName": "Unknown"})
-    except Exception as e:
-        print(f"Error in whoami: {e}")
-        traceback.print_exc()
-        return jsonify({"error": "Server error"}), 500
-
-@app.route("/api/machines", methods=["GET"])
-def get_machines():
-    try:
-        if 'telegram_id' not in session:
-            return jsonify({"error": "Not logged in"}), 401
-
-        user_id = session['telegram_id']
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        try:
-            # Try with provisional_mint and room columns
-            cur.execute("""
-                SELECT id, machine_type, x, y, level, last_activated, is_offline, provisional_mint, room
-                FROM user_machines
-                WHERE user_id=?
-            """, (user_id,))
-            rows = cur.fetchall()
-            
-            machines = []
-            for r in rows:
-                machine = dict(r)
-                machines.append(machine)
-                
-        except sqlite3.OperationalError:
-            try:
-                # Try with provisional_mint only
-                cur.execute("""
-                    SELECT id, machine_type, x, y, level, last_activated, is_offline, provisional_mint
-                    FROM user_machines
-                    WHERE user_id=?
-                """, (user_id,))
-                rows = cur.fetchall()
-                
-                machines = []
-                for r in rows:
-                    machine = dict(r)
-                    machine["room"] = 1  # Default room
-                    machines.append(machine)
-            except sqlite3.OperationalError:
-                # Fall back to old schema without provisional_mint and room
-                cur.execute("""
-                    SELECT id, machine_type, x, y, level, last_activated, is_offline
-                    FROM user_machines
-                    WHERE user_id=?
-                """, (user_id,))
-                rows = cur.fetchall()
-                
-                machines = []
-                for r in rows:
-                    machine = dict(r)
-                    machine["provisionalMint"] = 0  # Default value
-                    machine["room"] = 1  # Default room
-                    machines.append(machine)
-
-        cur.close()
-        conn.close()
-
-        # Convert SQLite row objects to proper dictionaries for JSON
-        machine_list = []
-        for m in machines:
-            machine_dict = {
-                "id": m["id"],
-                "type": m["machine_type"],
-                "x": m["x"],
-                "y": m["y"],
-                "level": m["level"],
-                "lastActivated": m["last_activated"],
-                "isOffline": m["is_offline"],
-                "room": m.get("room", 1)  # Default to room 1 if not present
-            }
-            
-            if "provisional_mint" in m:
-                machine_dict["provisionalMint"] = m["provisional_mint"]
-            else:
-                machine_dict["provisionalMint"] = 0
-                
-            machine_list.append(machine_dict)
-
-        return jsonify(machine_list)
-    except Exception as e:
-        print(f"Error in get_machines: {e}")
-        traceback.print_exc()
-        return jsonify({"error": "Server error"}), 500
-
-@app.route("/api/resources", methods=["GET"])
-def get_resources():
-    try:
-        if 'telegram_id' not in session:
-            return jsonify({"error": "Not logged in"}), 401
-
-        user_id = session['telegram_id']
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        cur.execute("SELECT corvax_count FROM users WHERE user_id=?", (user_id,))
-        row = cur.fetchone()
-        tcorvax = row["corvax_count"] if row else 0
-
-        catNips = get_or_create_resource(cur, user_id, 'catNips')
-        energy = get_or_create_resource(cur, user_id, 'energy')
-        eggs = get_or_create_resource(cur, user_id, 'eggs')
-
-        cur.close()
-        conn.close()
-
-        return jsonify({
-            "tcorvax": float(tcorvax),
-            "catNips": float(catNips),
-            "energy": float(energy),
-            "eggs": float(eggs)
-        })
-    except Exception as e:
-        print(f"Error in get_resources: {e}")
-        traceback.print_exc()
-        return jsonify({"error": "Server error"}), 500
+# New endpoints for Evolving Creatures
 
 @app.route("/api/checkXrdBalance", methods=["POST"])
 def check_xrd_balance():
@@ -4032,6 +4031,74 @@ def check_creature_mint_status():
         print(f"Error checking creature mint status: {e}")
         traceback.print_exc()
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+    
+# ──────────────────────────────────────────────────────────────
+# Diagnostic endpoint – check why NFTs might not be loading
+# ──────────────────────────────────────────────────────────────
+@app.route("/api/diagnoseNftFetch", methods=["POST"])
+def diagnose_nft_fetch():
+    """
+    Example request:
+      POST /api/diagnoseNftFetch
+      {
+        "accountAddress":  "account_rdx1…",
+        "resourceAddress": "resource_rdx1…"   # optional (defaults to CREATURE_NFT_RESOURCE)
+      }
+    """
+    try:
+        if "telegram_id" not in session:
+            return jsonify({"error": "Not logged in"}), 401
+
+        data = request.json or {}
+        account = data.get("accountAddress")
+        resource = data.get("resourceAddress", CREATURE_NFT_RESOURCE)
+
+        if not account:
+            return jsonify({"error": "No account address provided"}), 400
+
+        diag = {
+            "timestamp": time.time(),
+            "account": account,
+            "resource": resource,
+            "api_version": {"gateway_version": "v1.10+", "client_version": "1.2"},
+            "steps": []
+        }
+
+        # STEP 1 – skip old “/status/current” availability check because
+        #          the public mainnet node no longer exposes it.
+        diag["steps"].append({
+            "step": "Gateway availability check",
+            "status": "skipped",
+            "status_code": 0,
+            "response": "endpoint not available on this node"
+        })
+
+        # STEP 2 – fetch NFIDs with helper
+        try:
+            nfids = get_account_nfids(account, resource)
+            diag["steps"].append({
+                "step": "Get NFIDs / Get NFT data",
+                "status": "success" if nfids else "no_ids_found",
+                "nft_count": len(nfids),
+                "sample_ids": nfids[:5]
+            })
+        except Exception as exc:
+            diag["steps"].append({
+                "step": "Get NFIDs / Get NFT data",
+                "status": "error",
+                "error": str(exc)
+            })
+            return jsonify(diag)
+
+        # done – we don’t fetch full NFT data here; the objective is to
+        # confirm the node is returning NFIDs.
+        return jsonify(diag)
+
+    except Exception as exc:
+        print(f"Error in diagnose_nft_fetch: {exc}")
+        traceback.print_exc()
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
 
 @app.route("/api/getUserCreatures", methods=["GET", "POST"])
 def get_user_creatures():
@@ -4081,15 +4148,18 @@ def get_user_creatures():
             print(f"No Radix account address found for user {user_id}")
             return jsonify({"creatures": []})
         
-        # Fetch NFT IDs owned by this account using the improved function
-        print(f"Fetching creature NFTs for account: {account_address}")
-        nft_ids = fetch_user_nfts(account_address, CREATURE_NFT_RESOURCE)
-        
+                # ------------------------------------------------------------------
+        # 1)  Pull the list of NFIDs with the new helper
+        # ------------------------------------------------------------------
+        print(f"Fetching creature NFT IDs for account: {account_address}")
+        nft_ids = get_account_nfids(account_address, CREATURE_NFT_RESOURCE)
+
         if not nft_ids:
             print(f"No creature NFTs found for account {account_address}")
             return jsonify({"creatures": []})
-            
-        print(f"Found {len(nft_ids)} creature NFTs for account {account_address}")
+
+        print(f"Found {len(nft_ids)} creature NFTs: sample {nft_ids[:3]}")
+
         
         # Fetch NFT data for all IDs using the improved function
         nft_data_map = fetch_nft_data(CREATURE_NFT_RESOURCE, nft_ids)
@@ -4129,53 +4199,101 @@ def get_user_creatures():
         print(f"Error in get_user_creatures: {e}")
         traceback.print_exc()
         return jsonify({"error": f"Server error: {str(e)}"}), 500
-
-@app.route("/api/testNftData", methods=["POST"])
-def test_nft_data():
-    """API endpoint to test NFT data retrieval"""
+    
+@app.route("/api/dumpFirstEgg", methods=["POST"])
+def dump_first_egg():
+    """
+    Returns the complete `data` object the Gateway gives us for the first egg
+    in the wallet – no post-processing, no unwrap.  Use once, then remove it.
+    """
     try:
         if 'telegram_id' not in session:
             return jsonify({"error": "Not logged in"}), 401
-            
+
+        account = (request.json or {}).get("accountAddress")
+        if not account:
+            return jsonify({"error": "No account address provided"}), 400
+
+        # 1) list NFIDs (same helper as production)
+        nfids = get_account_nfids(account, CREATURE_NFT_RESOURCE)
+        if not nfids:
+            return jsonify({"error": "No creature NFTs found"}), 404
+
+        first = nfids[0]
+
+        # 2) ask for the raw data – but keep the whole `data` block
+        BASE = "https://mainnet.radixdlt.com"
+        hdrs = {"Content-Type": "application/json",
+                "User-Agent": "CorvaxLab debug/1.0"}
+
+        # pin a state_version so the request is deterministic
+        st   = requests.post(f"{BASE}/status/gateway-status",
+                             json={}, headers=hdrs, timeout=10).json()
+        selector = {"state_version": st["ledger_state"]["state_version"]}
+
+        body = {
+            "at_ledger_state": selector,
+            "resource_address": CREATURE_NFT_RESOURCE,
+            "non_fungible_ids": [first]
+        }
+
+        r = requests.post(f"{BASE}/state/non-fungible/data",
+                          json=body, headers=hdrs, timeout=20)
+        r.raise_for_status()
+
+        entry = r.json()["non_fungible_ids"][0]   # only one id
+
+        # return the whole entry so we can inspect it
+        return jsonify({
+            "nfid": first,
+            "gateway_entry": entry
+        })
+
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": str(exc)}), 500
+
+@app.route("/api/testNftData", methods=["POST"])
+def test_nft_data():
+    """
+    Quick diagnostics: pull one NFT’s raw programmatic_json so we can see what
+    the node is really returning.
+    """
+    try:
+        if 'telegram_id' not in session:
+            return jsonify({"error": "Not logged in"}), 401
+
         data = request.json or {}
         account_address = data.get("accountAddress")
-        
         if not account_address:
             return jsonify({"error": "No account address provided"}), 400
-            
-        # Step 1: Get NFT IDs
-        nft_ids = fetch_user_nfts(account_address, CREATURE_NFT_RESOURCE)
-        
+
+        # ────────────────────────────────────────────────────────────────
+        # 1) use the SAME helper as getUserCreatures so we see the IDs
+        # ────────────────────────────────────────────────────────────────
+        nft_ids = get_account_nfids(account_address, CREATURE_NFT_RESOURCE)
         if not nft_ids:
             return jsonify({"step1": "No NFTs found", "ids": []})
-            
-        # Step 2: Get data for first NFT to test
-        test_id = nft_ids[0]
-        nft_data = fetch_nft_data(CREATURE_NFT_RESOURCE, [test_id])
-        
-        if not nft_data or test_id not in nft_data:
-            return jsonify({
-                "step1": f"Found {len(nft_ids)} NFT IDs", 
-                "ids": nft_ids[:5],  # Show first 5 IDs
-                "step2": "Failed to get NFT data"
-            })
-            
-        # Step 3: Process the data
-        raw_data = nft_data[test_id]
-        processed_data = process_creature_data(test_id, raw_data)
-        
+
+        # 2) grab the very first NFT’s metadata
+        first_id = nft_ids[0]
+        raw_map  = fetch_nft_data(CREATURE_NFT_RESOURCE, [first_id])
+        raw_data = raw_map.get(first_id, {})
+
+        # 3) run it through the normal processing pipeline too
+        processed = process_creature_data(first_id, raw_data)
+
         return jsonify({
-            "step1": f"Found {len(nft_ids)} NFT IDs", 
-            "ids": nft_ids[:5],  # Show first 5 IDs
-            "step2": "Successfully got NFT data",
-            "raw_data": raw_data,
-            "step3": "Successfully processed data",
-            "processed_data": processed_data
+            "step1": f"Found {len(nft_ids)} NFT IDs",
+            "ids": nft_ids[:5],
+            "raw_data": raw_data,            # ← what we need to inspect
+            "processed_data": processed
         })
-    except Exception as e:
-        print(f"Error in test_nft_data: {e}")
+
+    except Exception as exc:
+        print(f"Error in test_nft_data: {exc}")
         traceback.print_exc()
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        return jsonify({"error": str(exc)}), 500
 
 @app.route("/api/getUpgradeStatsManifest", methods=["POST"])
 def get_upgrade_stats_manifest():
@@ -4420,154 +4538,6 @@ def get_combine_creatures_manifest():
         print(f"Error in get_combine_creatures_manifest: {e}")
         traceback.print_exc()
         return jsonify({"error": f"Server error: {str(e)}"}), 500
-
-def calculate_upgrade_cost(creature, energy=0, strength=0, magic=0, stamina=0, speed=0):
-    """
-    Calculate the cost for upgrading stats for a creature.
-    Returns: dict with token and amount
-    """
-    try:
-        # First try to use the provided creature data
-        if creature:
-            # Get species info
-            species_id = creature.get("species_id", 1)
-            species_info = SPECIES_DATA.get(species_id, {})
-            
-            # Get preferred token
-            token_symbol = species_info.get("preferred_token", "XRD")
-            
-            # Get form
-            form = creature.get("form", 0)
-            
-            # Default stat price if not specified
-            stat_price = species_info.get("stat_price", 50)
-            
-            # For final form (form 3), cost is stat_price * total points
-            if form == 3:
-                total_points = energy + strength + magic + stamina + speed
-                return {
-                    "token": token_symbol,
-                    "amount": stat_price * total_points
-                }
-            
-            # For forms 0-2, cost depends on which upgrade it is
-            evolution_progress = creature.get("evolution_progress", {})
-            if not evolution_progress:
-                return {
-                    "token": token_symbol,
-                    "amount": 0
-                }
-                
-            upgrades_completed = evolution_progress.get("stat_upgrades_completed", 0)
-            
-            # Cost increases with each upgrade (10%, 20%, 30% of evolution price)
-            evolution_prices = species_info.get("evolution_prices", [50, 100, 200])
-            if form < len(evolution_prices):
-                evolution_price = evolution_prices[form]
-            else:
-                evolution_price = evolution_prices[-1]
-                
-            # Calculate percentage based on upgrade number
-            percentage = 0.1 * (upgrades_completed + 1)  # 0.1, 0.2, 0.3
-            upgrade_cost = evolution_price * percentage
-            
-            return {
-                "token": token_symbol,
-                "amount": upgrade_cost
-            }
-        else:
-            # If no creature data provided, we need to fetch it from the blockchain
-            # This should be rare since we typically have the creature data already
-            return {
-                "token": "XRD",  # Default to XRD
-                "amount": 100    # Default amount
-            }
-    except Exception as e:
-        print(f"Error calculating upgrade cost: {e}")
-        traceback.print_exc()
-        return {
-            "token": "XRD",
-            "amount": 0
-        }
-
-def calculate_evolution_cost(creature):
-    """
-    Calculate the cost for evolving a creature to the next form.
-    Returns: dict with token and amount
-    """
-    try:
-        if not creature:
-            return {
-                "token": "XRD",
-                "amount": 0,
-                "can_evolve": False,
-                "reason": "Invalid creature data"
-            }
-            
-        # Get species info
-        species_id = creature.get("species_id", 1)
-        species_info = SPECIES_DATA.get(species_id, {})
-        
-        # Get preferred token
-        token_symbol = species_info.get("preferred_token", "XRD")
-        
-        # Get form
-        form = creature.get("form", 0)
-        
-        # Check if creature can evolve (must be form 0-2)
-        if form >= 3:
-            return {
-                "token": token_symbol,
-                "amount": 0,
-                "can_evolve": False,
-                "reason": "Already at max form"
-            }
-        
-        # Check if creature has completed 3 stat upgrades
-        evolution_progress = creature.get("evolution_progress", {})
-        if not evolution_progress:
-            return {
-                "token": token_symbol,
-                "amount": 0,
-                "can_evolve": False,
-                "reason": "No evolution progress data"
-            }
-                
-        upgrades_completed = evolution_progress.get("stat_upgrades_completed", 0)
-        if upgrades_completed < 3:
-            return {
-                "token": token_symbol,
-                "amount": 0,
-                "can_evolve": False,
-                "reason": f"Need 3 stat upgrades, only has {upgrades_completed}"
-            }
-        
-        # Get evolution price for current form
-        evolution_prices = species_info.get("evolution_prices", [50, 100, 200])
-        if form < len(evolution_prices):
-            evolution_price = evolution_prices[form]
-        else:
-            evolution_price = evolution_prices[-1]
-                
-        # Calculate total already paid in upgrades
-        # Typically 10% + 20% + 30% = 60% of full evolution price
-        paid_percentage = 0.6  # 0.1 + 0.2 + 0.3
-        remaining_cost = evolution_price * (1 - paid_percentage)
-        
-        return {
-            "token": token_symbol,
-            "amount": remaining_cost,
-            "can_evolve": True
-        }
-    except Exception as e:
-        print(f"Error calculating evolution cost: {e}")
-        traceback.print_exc()
-        return {
-            "token": "XRD",
-            "amount": 0,
-            "can_evolve": False,
-            "reason": f"Error: {str(e)}"
-        }
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=False)

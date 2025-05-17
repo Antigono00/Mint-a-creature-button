@@ -1,5 +1,5 @@
 // src/components/CreaturesViewer.jsx
-import { useContext, useState, useEffect } from 'react';
+import { useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { GameContext } from '../context/GameContext';
 import { useRadixConnect } from '../context/RadixConnectContext';
 import UpgradeStatsModal from './UpgradeStatsModal';
@@ -27,6 +27,10 @@ const CreaturesViewer = ({ onClose }) => {
   const [selectedCreatureId, setSelectedCreatureId] = useState(null);
   const [error, setError] = useState(null);
   const [showRefreshButton, setShowRefreshButton] = useState(false);
+  const [lastLoadTime, setLastLoadTime] = useState(0);
+  const [loadingCount, setLoadingCount] = useState(0);
+  const [lastSuccessfulCreatures, setLastSuccessfulCreatures] = useState([]);
+  const loadLockRef = useRef(false);
   
   // Stats details modal state
   const [showStatsDetail, setShowStatsDetail] = useState(false);
@@ -36,30 +40,52 @@ const CreaturesViewer = ({ onClose }) => {
   const [showUpgradeModal, setShowUpgradeModal] = useState(false);
   const [creatureToUpgrade, setCreatureToUpgrade] = useState(null);
 
-  // Check connection status
-  useEffect(() => {
-    if (!connected) {
-      setConnectionStatus('disconnected');
-      setIsLoading(false);
-    } else if (!accounts || accounts.length === 0) {
-      setConnectionStatus('connected-no-accounts');
-      setIsLoading(false);
-    } else {
-      setConnectionStatus('ready');
-      // Only load creatures if we have an account
-      loadCreatures();
-    }
-  }, [connected, accounts]);
-
   // Load creatures from the API
-  const loadCreatures = async () => {
+  const loadCreatures = useCallback(async (force = false) => {
     if (!connected || !accounts || accounts.length === 0) return;
     
+    // Implement a lock to prevent concurrent loads
+    if (loadLockRef.current && !force) {
+      console.log("Load creatures locked - skipping duplicate request");
+      return;
+    }
+    
+    // Add rate limiting - prevent loading more than once every 3 seconds
+    const now = Date.now();
+    if (!force && now - lastLoadTime < 3000 && creatures.length > 0) {
+      console.log("Rate limiting creatures load - too soon since last load");
+      return;
+    }
+    
+    // Activate lock
+    loadLockRef.current = true;
+    
+    // Increment loading count so UI knows we're making a request
+    setLoadingCount(prev => prev + 1);
     setIsLoading(true);
     setError(null);
+    setLastLoadTime(now);
     
     try {
       const accountAddress = accounts[0].address;
+      
+      // Try to get cached creatures first if we have empty results
+      const cachedCreatures = localStorage.getItem(`creatures_${accountAddress}`);
+      let parsedCache = null;
+      
+      if (cachedCreatures) {
+        try {
+          parsedCache = JSON.parse(cachedCreatures);
+          // Check if cache is fresh (less than 5 minutes old)
+          const cacheAge = now - (parsedCache.timestamp || 0);
+          if (cacheAge > 5 * 60 * 1000) {
+            console.log("Cache expired, fetching fresh data");
+            parsedCache = null;
+          }
+        } catch (e) {
+          console.error("Error parsing cached creatures:", e);
+        }
+      }
       
       // Use our API endpoint to get all user creatures
       const response = await fetch('/api/getUserCreatures', {
@@ -81,14 +107,35 @@ const CreaturesViewer = ({ onClose }) => {
       const data = await response.json();
       console.log("Creatures data:", data);
       
-      if (data.creatures && Array.isArray(data.creatures)) {
+      if (data.creatures && Array.isArray(data.creatures) && data.creatures.length > 0) {
+        // Update cache with fresh data
+        localStorage.setItem(`creatures_${accountAddress}`, JSON.stringify({
+          creatures: data.creatures,
+          timestamp: Date.now()
+        }));
+        
         setCreatures(data.creatures);
-        // If we have creatures, select the first one by default
-        if (data.creatures.length > 0) {
+        setLastSuccessfulCreatures(data.creatures);
+        
+        // If we have creatures, select the first one by default if none selected
+        if (data.creatures.length > 0 && !selectedCreatureId) {
           setSelectedCreatureId(data.creatures[0].id);
         }
-      } else {
-        setCreatures([]);
+      } else if (data.creatures && Array.isArray(data.creatures) && data.creatures.length === 0) {
+        // Empty array returned
+        if (creatures.length > 0) {
+          console.log("Received empty creatures array but keeping existing data");
+        } else if (parsedCache && parsedCache.creatures && parsedCache.creatures.length > 0) {
+          // Use cached data as fallback
+          console.log("Using cached creatures data as fallback");
+          setCreatures(parsedCache.creatures);
+          if (!selectedCreatureId && parsedCache.creatures.length > 0) {
+            setSelectedCreatureId(parsedCache.creatures[0].id);
+          }
+        } else {
+          // No existing data, no cache, empty response
+          setCreatures([]);
+        }
       }
       
       // Show refresh button after first load
@@ -96,10 +143,53 @@ const CreaturesViewer = ({ onClose }) => {
     } catch (error) {
       console.error("Error loading creatures:", error);
       setError(`Failed to load creatures: ${error.message}`);
+      
+      // Try to use cached data on error
+      try {
+        const accountAddress = accounts[0].address;
+        const cachedCreatures = localStorage.getItem(`creatures_${accountAddress}`);
+        if (cachedCreatures) {
+          const parsedCache = JSON.parse(cachedCreatures);
+          if (parsedCache.creatures && parsedCache.creatures.length > 0) {
+            console.log("Using cached creatures data on API error");
+            if (creatures.length === 0) {
+              setCreatures(parsedCache.creatures);
+              if (!selectedCreatureId && parsedCache.creatures.length > 0) {
+                setSelectedCreatureId(parsedCache.creatures[0].id);
+              }
+            }
+          }
+        } else if (lastSuccessfulCreatures.length > 0) {
+          // Fallback to the last successful load
+          setCreatures(lastSuccessfulCreatures);
+        }
+      } catch (cacheError) {
+        console.error("Error using cached creatures:", cacheError);
+      }
     } finally {
       setIsLoading(false);
+      setLoadingCount(prev => prev - 1);
+      // Release lock after a short delay to prevent immediate subsequent requests
+      setTimeout(() => {
+        loadLockRef.current = false;
+      }, 500);
     }
-  };
+  }, [connected, accounts, lastLoadTime, creatures, selectedCreatureId, lastSuccessfulCreatures]);
+
+  // Check connection status
+  useEffect(() => {
+    if (!connected) {
+      setConnectionStatus('disconnected');
+      setIsLoading(false);
+    } else if (!accounts || accounts.length === 0) {
+      setConnectionStatus('connected-no-accounts');
+      setIsLoading(false);
+    } else {
+      setConnectionStatus('ready');
+      // Only load creatures if we have an account
+      loadCreatures();
+    }
+  }, [connected, accounts, loadCreatures]);
 
   // Function to open the upgrade modal with the selected creature
   const handleUpgradeStats = (creature) => {
@@ -107,13 +197,77 @@ const CreaturesViewer = ({ onClose }) => {
     setShowUpgradeModal(true);
   };
 
-  // Function to handle successful upgrades by refreshing the data
-  const handleUpgradeSuccess = () => {
-    // Reload creatures data
-    loadCreatures();
-    // Show a notification
-    addNotification?.('Creature upgraded successfully!', 400, 300, '#4CAF50');
-  };
+  // Function to handle successful upgrades
+  const handleUpgradeSuccess = useCallback((updatedCreature) => {
+    // Prevent duplicate notifications by checking timing
+    const now = Date.now();
+    const lastNotificationTime = parseInt(localStorage.getItem('last_upgrade_notification') || '0');
+    
+    if (now - lastNotificationTime > 2000) {
+      // Store the notification time
+      localStorage.setItem('last_upgrade_notification', now.toString());
+      
+      // Show success notification with unique ID to prevent duplicates
+      const notificationId = "upgrade-success-" + now;
+      addNotification?.('Creature upgraded successfully!', 400, 300, '#4CAF50', notificationId);
+    }
+    
+    // If we have an updated creature directly, use it
+    if (updatedCreature) {
+      // Update the creature in the local state instead of reloading everything
+      setCreatures(prevCreatures => {
+        const newCreatures = prevCreatures.map(c => 
+          c.id === updatedCreature.id ? updatedCreature : c
+        );
+        
+        // Also update cache
+        if (accounts && accounts.length > 0) {
+          const accountAddress = accounts[0].address;
+          localStorage.setItem(`creatures_${accountAddress}`, JSON.stringify({
+            creatures: newCreatures,
+            timestamp: Date.now()
+          }));
+        }
+        
+        return newCreatures;
+      });
+    } else {
+      // If no direct creature data, schedule a reload after a delay
+      const delayTime = 3000;
+      console.log(`Scheduling reload after ${delayTime/1000} seconds`);
+      // Use a unique timeout ID and store it to avoid duplicate reloads
+      const timeoutId = setTimeout(() => {
+        console.log("Executing delayed reload");
+        loadCreatures(true); // Force reload
+      }, delayTime);
+      
+      // Store the timeout ID to potentially cancel it
+      window._lastUpgradeTimeout = timeoutId;
+    }
+  }, [accounts, addNotification, loadCreatures]);
+
+  // Use useEffect to setup periodic refresh attempts after failed loads
+  useEffect(() => {
+    // If we have an error and no creatures, try to reload periodically
+    if (error && creatures.length === 0 && connected && accounts?.length > 0) {
+      console.log("Setting up recovery reload timer");
+      const recoveryTimeout = setTimeout(() => {
+        console.log("Attempting recovery reload");
+        loadCreatures();
+      }, 8000); // Try every 8 seconds
+      
+      return () => clearTimeout(recoveryTimeout);
+    }
+  }, [error, creatures, connected, accounts, loadCreatures]);
+
+  // Cancel any pending timeouts when unmounting
+  useEffect(() => {
+    return () => {
+      if (window._lastUpgradeTimeout) {
+        clearTimeout(window._lastUpgradeTimeout);
+      }
+    };
+  }, []);
 
   // Handler for viewing detailed stats
   const handleViewStatsDetail = (creature) => {
@@ -288,7 +442,7 @@ const CreaturesViewer = ({ onClose }) => {
             {/* Refresh button */}
             {showRefreshButton && (
               <button
-                onClick={loadCreatures}
+                onClick={() => loadCreatures(true)} // Force refresh
                 disabled={isLoading}
                 style={{
                   backgroundColor: isLoading ? '#555' : '#2196F3',
@@ -472,7 +626,7 @@ const CreaturesViewer = ({ onClose }) => {
               <p><strong>Error loading creatures</strong></p>
               <p>{error}</p>
               <button
-                onClick={loadCreatures}
+                onClick={() => loadCreatures(true)} // Force refresh on error
                 style={{
                   backgroundColor: '#F44336',
                   color: 'white',

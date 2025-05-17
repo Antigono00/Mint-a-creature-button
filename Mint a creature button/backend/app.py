@@ -1167,6 +1167,8 @@ FORM_SUFFIX = {
 }
 
 
+# Here's a more robust version of calculate_upgrade_cost:
+
 def calculate_upgrade_cost(creature, energy=0, strength=0, magic=0, stamina=0, speed=0):
     """
     Calculate the cost for upgrading stats for a creature.
@@ -1177,7 +1179,7 @@ def calculate_upgrade_cost(creature, energy=0, strength=0, magic=0, stamina=0, s
         if creature:
             # Get species info
             species_id = creature.get("species_id", 1)
-            species_info = SPECIES_DATA.get(species_id, {})
+            species_info = SPECIES_DATA.get(species_id, SPECIES_DATA[1])
             
             # Get preferred token
             token_symbol = species_info.get("preferred_token", "XRD")
@@ -1196,123 +1198,51 @@ def calculate_upgrade_cost(creature, energy=0, strength=0, magic=0, stamina=0, s
                     "amount": stat_price * total_points
                 }
             
-            # For forms 0-2, cost depends on which upgrade it is
-            evolution_progress = creature.get("evolution_progress", {})
-            if not evolution_progress:
-                return {
-                    "token": token_symbol,
-                    "amount": 0
-                }
-                
-            upgrades_completed = evolution_progress.get("stat_upgrades_completed", 0)
-            
-            # Cost increases with each upgrade (10%, 20%, 30% of evolution price)
+            # Get evolution prices
             evolution_prices = species_info.get("evolution_prices", [50, 100, 200])
             if form < len(evolution_prices):
                 evolution_price = evolution_prices[form]
             else:
                 evolution_price = evolution_prices[-1]
-                
-            # Calculate percentage based on upgrade number
+            
+            # Get upgrade number (default to 0 if missing)
+            upgrades_completed = 0
+            evolution_progress = creature.get("evolution_progress", {})
+            if evolution_progress:
+                upgrades_completed = evolution_progress.get("stat_upgrades_completed", 0)
+            
+            # Cost increases with each upgrade (10%, 20%, 30% of evolution price)
             percentage = 0.1 * (upgrades_completed + 1)  # 0.1, 0.2, 0.3
             upgrade_cost = evolution_price * percentage
+            
+            # Ensure minimum cost of 1 token for most tokens
+            # But allow decimal values for tokens that support it (like FLOOP or CASSIE)
+            if token_symbol in ["FLOOP", "CASSIE"]:
+                # Ensure at least 0.001 for tokens that can have small decimal amounts
+                upgrade_cost = max(0.001, upgrade_cost)
+            else:
+                # Round up to nearest integer for most tokens
+                upgrade_cost = max(1, round(upgrade_cost))
+            
+            print(f"Calculated cost for {species_info['name']} (form {form}, upgrade {upgrades_completed+1}): {upgrade_cost} {token_symbol}")
+            print(f"Base evolution price: {evolution_price}, Percentage: {percentage*100}%")
             
             return {
                 "token": token_symbol,
                 "amount": upgrade_cost
             }
         else:
-            # If no creature data provided, we need to fetch it from the blockchain
-            # This should be rare since we typically have the creature data already
+            # If no creature data provided, default to XRD
             return {
-                "token": "XRD",  # Default to XRD
-                "amount": 100    # Default amount
+                "token": "XRD",
+                "amount": 50  # Default amount
             }
     except Exception as e:
         print(f"Error calculating upgrade cost: {e}")
         traceback.print_exc()
         return {
             "token": "XRD",
-            "amount": 0
-        }
-
-def calculate_evolution_cost(creature):
-    """
-    Calculate the cost for evolving a creature to the next form.
-    Returns: dict with token and amount
-    """
-    try:
-        if not creature:
-            return {
-                "token": "XRD",
-                "amount": 0,
-                "can_evolve": False,
-                "reason": "Invalid creature data"
-            }
-            
-        # Get species info
-        species_id = creature.get("species_id", 1)
-        species_info = SPECIES_DATA.get(species_id, {})
-        
-        # Get preferred token
-        token_symbol = species_info.get("preferred_token", "XRD")
-        
-        # Get form
-        form = creature.get("form", 0)
-        
-        # Check if creature can evolve (must be form 0-2)
-        if form >= 3:
-            return {
-                "token": token_symbol,
-                "amount": 0,
-                "can_evolve": False,
-                "reason": "Already at max form"
-            }
-        
-        # Check if creature has completed 3 stat upgrades
-        evolution_progress = creature.get("evolution_progress", {})
-        if not evolution_progress:
-            return {
-                "token": token_symbol,
-                "amount": 0,
-                "can_evolve": False,
-                "reason": "No evolution progress data"
-            }
-                
-        upgrades_completed = evolution_progress.get("stat_upgrades_completed", 0)
-        if upgrades_completed < 3:
-            return {
-                "token": token_symbol,
-                "amount": 0,
-                "can_evolve": False,
-                "reason": f"Need 3 stat upgrades, only has {upgrades_completed}"
-            }
-        
-        # Get evolution price for current form
-        evolution_prices = species_info.get("evolution_prices", [50, 100, 200])
-        if form < len(evolution_prices):
-            evolution_price = evolution_prices[form]
-        else:
-            evolution_price = evolution_prices[-1]
-                
-        # Calculate total already paid in upgrades
-        # Typically 10% + 20% + 30% = 60% of full evolution price
-        paid_percentage = 0.6  # 0.1 + 0.2 + 0.3
-        remaining_cost = evolution_price * (1 - paid_percentage)
-        
-        return {
-            "token": token_symbol,
-            "amount": remaining_cost,
-            "can_evolve": True
-        }
-    except Exception as e:
-        print(f"Error calculating evolution cost: {e}")
-        traceback.print_exc()
-        return {
-            "token": "XRD",
-            "amount": 0,
-            "can_evolve": False,
-            "reason": f"Error: {str(e)}"
+            "amount": 50  # Safe fallback
         }
 
 def can_build_fomo_hit(cur, user_id):
@@ -4294,6 +4224,153 @@ def test_nft_data():
         print(f"Error in test_nft_data: {exc}")
         traceback.print_exc()
         return jsonify({"error": str(exc)}), 500
+    
+# Add this to app.py
+@app.route("/api/checkUpgradeStatus", methods=["POST"])
+def check_upgrade_status():
+    try:
+        if 'telegram_id' not in session:
+            return jsonify({"error": "Not logged in"}), 401
+            
+        data = request.json or {}
+        intent_hash = data.get("intentHash")
+        creature_id = data.get("creatureId")
+        
+        if not intent_hash:
+            return jsonify({"error": "Missing transaction intent hash"}), 400
+            
+        # Get the transaction status
+        status_data = get_transaction_status(intent_hash)
+        
+        # If the transaction is committed successfully, try to get updated NFT data
+        updated_creature = None
+        
+        if status_data.get("status") == "CommittedSuccess":
+            try:
+                # Add a small delay to allow blockchain state to update before fetching
+                # This helps ensure we get the latest data after the transaction
+                time.sleep(2)
+                
+                # Try to get the updated creature data from the blockchain
+                user_id = session['telegram_id']
+                conn = get_db_connection()
+                cur = conn.cursor()
+                
+                # Check if we have a stored Radix account
+                cur.execute("""
+                    SELECT radix_account_address FROM users 
+                    WHERE user_id = ? AND radix_account_address IS NOT NULL
+                """, (user_id,))
+                
+                row = cur.fetchone()
+                account_address = None
+                if row:
+                    account_address = row['radix_account_address']
+                
+                cur.close()
+                conn.close()
+                
+                # If we have an account address, try to fetch the updated creature
+                if account_address and creature_id:
+                    print(f"Fetching updated creature data for ID: {creature_id}")
+                    
+                    # Fetch NFT data for the specific creature ID
+                    nft_data_map = fetch_nft_data(CREATURE_NFT_RESOURCE, [creature_id])
+                    
+                    if nft_data_map and creature_id in nft_data_map:
+                        raw_data = nft_data_map[creature_id]
+                        updated_creature = process_creature_data(creature_id, raw_data)
+                        print(f"Successfully retrieved updated creature data")
+                    else:
+                        print(f"Could not find creature with ID {creature_id} in NFT data")
+            except Exception as e:
+                print(f"Error fetching updated creature data: {e}")
+                traceback.print_exc()
+                # Continue even if we can't get updated data
+        
+        return jsonify({
+            "status": "ok",
+            "transactionStatus": status_data,
+            "updatedCreature": updated_creature
+        })
+    except Exception as e:
+        print(f"Error checking upgrade status: {e}")
+        traceback.print_exc()
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    
+# Add this to app.py after the checkXrdBalance endpoint
+@app.route("/api/checkTokenBalance", methods=["POST"])
+def check_token_balance():
+    try:
+        if 'telegram_id' not in session:
+            return jsonify({"error": "Not logged in"}), 401
+
+        data = request.json or {}
+        account_address = data.get("accountAddress")
+        token_symbol = data.get("tokenSymbol", "XRD")
+        force_refresh = data.get("forceRefresh", False)
+        
+        if not account_address:
+            return jsonify({
+                "error": "No account address provided",
+                "tokenBalance": 0,
+                "hasEnoughTokens": False,
+                "statusMessage": "Missing account address"
+            }), 400
+            
+        # Validate token symbol
+        if token_symbol not in TOKEN_ADDRESSES:
+            print(f"Warning: Invalid token symbol requested: {token_symbol}")
+            return jsonify({
+                "error": f"Invalid token symbol: {token_symbol}",
+                "tokenBalance": 0,
+                "hasEnoughTokens": False,
+                "statusMessage": f"Unknown token: {token_symbol}"
+            }), 400
+        
+        print(f"Checking {token_symbol} balance for account: {account_address}")
+        
+        # Try up to 2 times to fetch the token balance
+        max_attempts = 2
+        token_balance = 0
+        
+        for attempt in range(max_attempts):
+            try:
+                # Fetch token balance using the Gateway API function
+                token_balance = fetch_token_balance(account_address, token_symbol)
+                
+                if token_balance > 0:
+                    # We got a positive balance, no need for more attempts
+                    break
+                    
+                if attempt < max_attempts - 1:
+                    print(f"First attempt returned {token_balance} {token_symbol}, retrying...")
+                    time.sleep(1)  # Short delay before retry
+            except Exception as e:
+                print(f"Attempt {attempt+1} failed: {str(e)}")
+                if attempt < max_attempts - 1:
+                    time.sleep(1)  # Short delay before retry
+        
+        # Prepare diagnostic info
+        status_message = "Balance check successful"
+        if token_balance == 0:
+            status_message = f"Could not detect {token_symbol} in account - please ensure you have enough tokens"
+        
+        return jsonify({
+            "status": "ok",
+            "tokenBalance": token_balance,
+            "tokenSymbol": token_symbol,
+            "statusMessage": status_message
+        })
+    except Exception as e:
+        print(f"Error checking {token_symbol} balance: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "error": f"Server error: {str(e)}",
+            "tokenBalance": 0,
+            "tokenSymbol": token_symbol,
+            "statusMessage": "Error checking balance"
+        }), 500
 
 @app.route("/api/getUpgradeStatsManifest", methods=["POST"])
 def get_upgrade_stats_manifest():

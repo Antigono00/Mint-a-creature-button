@@ -2,12 +2,14 @@
 import { useContext, useState, useEffect } from 'react';
 import { GameContext } from '../context/GameContext';
 import { useRadixConnect } from '../context/RadixConnectContext';
+import UpgradeStatsModal from './UpgradeStatsModal';
 
 const CreaturesViewer = ({ onClose }) => {
   // Game context
   const {
     isMobile,
-    formatResource
+    formatResource,
+    addNotification
   } = useContext(GameContext);
 
   // From the RadixConnect context
@@ -29,6 +31,10 @@ const CreaturesViewer = ({ onClose }) => {
   // Stats details modal state
   const [showStatsDetail, setShowStatsDetail] = useState(false);
   const [detailedCreature, setDetailedCreature] = useState(null);
+
+  // Upgrade modal states
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false);
+  const [creatureToUpgrade, setCreatureToUpgrade] = useState(null);
 
   // Check connection status
   useEffect(() => {
@@ -93,6 +99,20 @@ const CreaturesViewer = ({ onClose }) => {
     } finally {
       setIsLoading(false);
     }
+  };
+
+  // Function to open the upgrade modal with the selected creature
+  const handleUpgradeStats = (creature) => {
+    setCreatureToUpgrade(creature);
+    setShowUpgradeModal(true);
+  };
+
+  // Function to handle successful upgrades by refreshing the data
+  const handleUpgradeSuccess = () => {
+    // Reload creatures data
+    loadCreatures();
+    // Show a notification
+    addNotification?.('Creature upgraded successfully!', 400, 300, '#4CAF50');
   };
 
   // Handler for viewing detailed stats
@@ -816,10 +836,7 @@ const CreaturesViewer = ({ onClose }) => {
                                 alignItems: 'center',
                                 gap: '5px'
                               }}
-                              onClick={() => {
-                                // For now, just show stats - would link to upgrade UI
-                                handleViewStatsDetail(selectedCreature);
-                              }}
+                              onClick={() => handleUpgradeStats(selectedCreature)}
                             >
                               <span role="img" aria-label="upgrade">⬆️</span>
                               Upgrade Stats
@@ -1320,6 +1337,10 @@ const CreaturesViewer = ({ onClose }) => {
                     alignItems: 'center',
                     gap: '5px'
                   }}
+                  onClick={() => {
+                    handleCloseStatsDetail();
+                    handleUpgradeStats(detailedCreature);
+                  }}
                 >
                   <span role="img" aria-label="upgrade">⬆️</span>
                   Upgrade Stats
@@ -1361,6 +1382,15 @@ const CreaturesViewer = ({ onClose }) => {
             </div>
           </div>
         </>
+      )}
+      
+      {/* Upgrade Stats Modal */}
+      {showUpgradeModal && creatureToUpgrade && (
+        <UpgradeStatsModal 
+          creature={creatureToUpgrade}
+          onClose={() => setShowUpgradeModal(false)}
+          onSuccess={handleUpgradeSuccess}
+        />
       )}
       
       <style>{`

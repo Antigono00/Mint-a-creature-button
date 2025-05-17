@@ -1176,67 +1176,93 @@ def calculate_upgrade_cost(creature, energy=0, strength=0, magic=0, stamina=0, s
     """
     try:
         # First try to use the provided creature data
-        if creature:
-            # Get species info
+        if not creature:
+            print("Warning: No creature data provided for cost calculation")
+            return {"token": "XRD", "amount": 50}  # Default fallback
+            
+        # Get species info
+        species_id = None
+        try:
+            # Ensure species_id is an integer
+            species_id = int(creature.get("species_id", 1))
+        except (ValueError, TypeError):
+            # If conversion fails, try to use the value directly
             species_id = creature.get("species_id", 1)
-            species_info = SPECIES_DATA.get(species_id, SPECIES_DATA[1])
             
-            # Get preferred token
-            token_symbol = species_info.get("preferred_token", "XRD")
-            
-            # Get form
-            form = creature.get("form", 0)
-            
-            # Default stat price if not specified
-            stat_price = species_info.get("stat_price", 50)
-            
-            # For final form (form 3), cost is stat_price * total points
-            if form == 3:
-                total_points = energy + strength + magic + stamina + speed
-                return {
-                    "token": token_symbol,
-                    "amount": stat_price * total_points
-                }
-            
-            # Get evolution prices
-            evolution_prices = species_info.get("evolution_prices", [50, 100, 200])
-            if form < len(evolution_prices):
-                evolution_price = evolution_prices[form]
-            else:
-                evolution_price = evolution_prices[-1]
-            
-            # Get upgrade number (default to 0 if missing)
-            upgrades_completed = 0
-            evolution_progress = creature.get("evolution_progress", {})
-            if evolution_progress:
-                upgrades_completed = evolution_progress.get("stat_upgrades_completed", 0)
-            
-            # Cost increases with each upgrade (10%, 20%, 30% of evolution price)
-            percentage = 0.1 * (upgrades_completed + 1)  # 0.1, 0.2, 0.3
-            upgrade_cost = evolution_price * percentage
-            
-            # Ensure minimum cost of 1 token for most tokens
-            # But allow decimal values for tokens that support it (like FLOOP or CASSIE)
-            if token_symbol in ["FLOOP", "CASSIE"]:
-                # Ensure at least 0.001 for tokens that can have small decimal amounts
-                upgrade_cost = max(0.001, upgrade_cost)
-            else:
-                # Round up to nearest integer for most tokens
-                upgrade_cost = max(1, round(upgrade_cost))
-            
-            print(f"Calculated cost for {species_info['name']} (form {form}, upgrade {upgrades_completed+1}): {upgrade_cost} {token_symbol}")
-            print(f"Base evolution price: {evolution_price}, Percentage: {percentage*100}%")
-            
+        species_info = SPECIES_DATA.get(species_id)
+        
+        # If not found by ID, try by name as a fallback
+        if not species_info and "species_name" in creature:
+            species_name = creature.get("species_name", "").lower()
+            for sid, data in SPECIES_DATA.items():
+                if data["name"].lower() == species_name:
+                    species_info = data
+                    species_id = sid
+                    break
+        
+        # If still not found, use default
+        if not species_info:
+            species_info = SPECIES_DATA[1]  # Default to Bullx
+            species_id = 1
+        
+        # Get preferred token
+        token_symbol = species_info.get("preferred_token", "XRD")
+        
+        # Get form (ensure it's an integer)
+        form = 0
+        try:
+            form = int(creature.get("form", 0))
+        except (ValueError, TypeError):
+            form = 0
+        
+        # Default stat price if not specified
+        stat_price = species_info.get("stat_price", 50)
+        
+        # For final form (form 3), cost is stat_price * total points
+        if form == 3:
+            total_points = energy + strength + magic + stamina + speed
             return {
                 "token": token_symbol,
-                "amount": upgrade_cost
+                "amount": stat_price * total_points
             }
+        
+        # Get evolution prices
+        evolution_prices = species_info.get("evolution_prices", [50, 100, 200])
+        if form < len(evolution_prices):
+            evolution_price = evolution_prices[form]
         else:
-            # If no creature data provided, default to XRD
-            return {
-                "token": "XRD",
-                "amount": 50  # Default amount
-            }
+            evolution_price = evolution_prices[-1]
+        
+        # Get upgrade number (default to 0 if missing)
+        upgrades_completed = 0
+        evolution_progress = creature.get("evolution_progress", {})
+        if evolution_progress:
+            # Convert upgrades_completed to integer
+            try:
+                upgrades_completed = int(evolution_progress.get("stat_upgrades_completed", 0))
+            except (ValueError, TypeError):
+                upgrades_completed = 0
+        
+        # Cost increases with each upgrade (10%, 20%, 30% of evolution price)
+        percentage = 0.1 * (upgrades_completed + 1)  # 0.1, 0.2, 0.3
+        upgrade_cost = evolution_price * percentage
+        
+        # Ensure minimum cost of 1 token for most tokens
+        # But allow decimal values for tokens that support it (like FLOOP or CASSIE)
+        if token_symbol in ["FLOOP", "CASSIE"]:
+            # Ensure at least 0.001 for tokens that can have small decimal amounts
+            upgrade_cost = max(0.001, upgrade_cost)
+        else:
+            # Round to nearest integer for most tokens
+            upgrade_cost = max(1, int(round(upgrade_cost)))
+        
+        print(f"Calculated cost for {species_info['name']} (form {form}, upgrade {upgrades_completed+1}): {upgrade_cost} {token_symbol}")
+        print(f"Base evolution price: {evolution_price}, Percentage: {percentage*100}%")
+            
+        return {
+            "token": token_symbol,
+            "amount": upgrade_cost
+        }
     except Exception as e:
         print(f"Error calculating upgrade cost: {e}")
         traceback.print_exc()
@@ -4239,6 +4265,24 @@ def check_upgrade_status():
         if not intent_hash:
             return jsonify({"error": "Missing transaction intent hash"}), 400
             
+        # Track API calls per session to prevent excessive calls
+        session_id = session.get('telegram_id')
+        call_counter_key = f"upgrade_status_calls_{session_id}_{intent_hash}"
+        call_counter = session.get(call_counter_key, 0)
+        
+        # Implement call rate limiting (max 5 calls per 30 seconds for same transaction)
+        if call_counter > 5:
+            # Return last known state without making external API calls
+            return jsonify({
+                "status": "rate_limited",
+                "message": "Too many status check requests. Please wait a moment before trying again.",
+                "transactionStatus": {"status": "Unknown", "message": "Rate limited"},
+                "shouldRetry": False  # Signal to client to stop polling
+            })
+        
+        # Increment counter
+        session[call_counter_key] = call_counter + 1
+        
         # Get the transaction status
         status_data = get_transaction_status(intent_hash)
         
@@ -4248,8 +4292,7 @@ def check_upgrade_status():
         if status_data.get("status") == "CommittedSuccess":
             try:
                 # Add a small delay to allow blockchain state to update before fetching
-                # This helps ensure we get the latest data after the transaction
-                time.sleep(2)
+                time.sleep(1)
                 
                 # Try to get the updated creature data from the blockchain
                 user_id = session['telegram_id']
@@ -4272,31 +4315,49 @@ def check_upgrade_status():
                 
                 # If we have an account address, try to fetch the updated creature
                 if account_address and creature_id:
-                    print(f"Fetching updated creature data for ID: {creature_id}")
-                    
-                    # Fetch NFT data for the specific creature ID
-                    nft_data_map = fetch_nft_data(CREATURE_NFT_RESOURCE, [creature_id])
-                    
-                    if nft_data_map and creature_id in nft_data_map:
-                        raw_data = nft_data_map[creature_id]
-                        updated_creature = process_creature_data(creature_id, raw_data)
-                        print(f"Successfully retrieved updated creature data")
-                    else:
-                        print(f"Could not find creature with ID {creature_id} in NFT data")
+                    try:
+                        # Fetch NFT data for the specific creature ID
+                        nft_data_map = fetch_nft_data(CREATURE_NFT_RESOURCE, [creature_id])
+                        
+                        if nft_data_map and creature_id in nft_data_map:
+                            raw_data = nft_data_map[creature_id]
+                            updated_creature = process_creature_data(creature_id, raw_data)
+                            print(f"Successfully retrieved updated creature data")
+                            # Clear session counter on success
+                            session.pop(call_counter_key, None)
+                    except Exception as inner_e:
+                        print(f"Error fetching creature data: {str(inner_e)}")
+                        traceback.print_exc()
             except Exception as e:
-                print(f"Error fetching updated creature data: {e}")
+                print(f"Error in checkUpgradeStatus: {e}")
                 traceback.print_exc()
-                # Continue even if we can't get updated data
+        
+        # For pending transactions, allow continued polling with decreasing frequency
+        if status_data.get("status") in ["Pending", "Submitted", "Unknown"]:
+            # Allow polling but reduce frequency based on counter
+            shouldRetry = True
+            # Suggest a longer wait time as the counter increases
+            suggested_wait = min(3000 * (1.5 ** min(call_counter, 5)), 20000)  # Max 20 seconds
+        else:
+            # For any other status (success, failure, etc), stop polling
+            shouldRetry = False
+            # Clear session counter
+            session.pop(call_counter_key, None)
         
         return jsonify({
             "status": "ok",
             "transactionStatus": status_data,
-            "updatedCreature": updated_creature
+            "updatedCreature": updated_creature,
+            "shouldRetry": shouldRetry,  # Signal whether client should continue polling
+            "suggestedWaitTime": suggested_wait if 'suggested_wait' in locals() else 3000  # Default 3 seconds
         })
     except Exception as e:
         print(f"Error checking upgrade status: {e}")
         traceback.print_exc()
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        return jsonify({
+            "error": f"Server error: {str(e)}",
+            "shouldRetry": False  # Stop polling on server errors
+        }), 500
     
 # Add this to app.py after the checkXrdBalance endpoint
 @app.route("/api/checkTokenBalance", methods=["POST"])

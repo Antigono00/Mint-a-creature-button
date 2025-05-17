@@ -1,5 +1,5 @@
 // src/components/UpgradeStatsModal.jsx
-import { useContext, useState, useEffect } from 'react';
+import { useContext, useState, useEffect, useRef } from 'react';
 import { GameContext } from '../context/GameContext';
 import { useRadixConnect } from '../context/RadixConnectContext';
 
@@ -27,6 +27,9 @@ const UpgradeStatsModal = ({ onClose, creature, onSuccess }) => {
   const [transactionDetails, setTransactionDetails] = useState(null);
   const [statusCheckCount, setStatusCheckCount] = useState(0);
   const [showConnectionDetails, setShowConnectionDetails] = useState(false);
+  
+  // Add to the top of the component
+  const successShownRef = useRef(false);
   
   // Stats allocation states
   const [energyPoints, setEnergyPoints] = useState(0);
@@ -180,13 +183,25 @@ const UpgradeStatsModal = ({ onClose, creature, onSuccess }) => {
     calculateCost();
   }, [connected, accounts, creature, totalAllocated, energyPoints, strengthPoints, magicPoints, staminaPoints, speedPoints]);
 
-  // Poll transaction status if we have an intent hash
+  // Improved transaction polling with exponential backoff
   useEffect(() => {
     if (intentHash && upgradingStage === 'pending') {
-      const maxStatusChecks = 30; // Limit how many times we check
+      // Reset success flag when starting a new transaction
+      successShownRef.current = false;
+      
+      const maxStatusChecks = 8; // Reduce max checks
+      let backoffTime = 3000; // Start with 3 seconds
       
       const checkStatus = async () => {
+        // Don't continue checking if component is unmounting/changing
+        if (upgradingStage !== 'pending') {
+          console.log("Cancelling status check - stage changed");
+          return;
+        }
+        
         try {
+          console.log(`Checking upgrade status (attempt ${statusCheckCount + 1}/${maxStatusChecks})...`);
+          
           const response = await fetch('/api/checkUpgradeStatus', {
             method: 'POST',
             headers: {
@@ -204,40 +219,122 @@ const UpgradeStatsModal = ({ onClose, creature, onSuccess }) => {
           }
           
           const data = await response.json();
+          console.log("Status response:", data);
+          
           setTransactionDetails(data.transactionStatus);
           
-          const txStatus = data.transactionStatus?.status;
+          // Get suggested wait time from server or use default
+          const nextWaitTime = data.suggestedWaitTime || backoffTime * 1.5;
           
-          if (txStatus === "CommittedSuccess") {
+          // Check if we have an updated creature
+          if (data.updatedCreature) {
+            console.log("Received updated creature data");
             setUpgradingStage('success');
             setIsLoading(false);
-            // Call onSuccess to update the parent component
-            if (onSuccess) onSuccess();
+            
+            // Only call onSuccess once
+            if (!successShownRef.current) {
+              successShownRef.current = true;
+              if (onSuccess) onSuccess(data.updatedCreature);
+            }
             return;
+          }
+          
+          const txStatus = data?.transactionStatus?.status;
+          
+          // Process transaction status
+          if (txStatus === "CommittedSuccess") {
+            console.log("Transaction success, waiting for creature data to update");
+            // Check if server says to stop retrying
+            if (data.shouldRetry === false) {
+              setUpgradingStage('success');
+              setIsLoading(false);
+              
+              // Only call onSuccess once
+              if (!successShownRef.current) {
+                successShownRef.current = true;
+                if (onSuccess) onSuccess();
+              }
+              return;
+            }
           } else if (txStatus === "Failed" || txStatus === "Rejected") {
             setUpgradingStage('failed');
             setIsLoading(false);
             return;
           }
           
+          // Check if server tells us to stop retrying
+          if (data.shouldRetry === false) {
+            console.log("Server indicated no more retries needed");
+            // If transaction was successful but no creature data yet
+            if (txStatus === "CommittedSuccess") {
+              setUpgradingStage('success');
+              
+              // Only call onSuccess once
+              if (!successShownRef.current) {
+                successShownRef.current = true;
+                if (onSuccess) onSuccess();
+              }
+            } else {
+              setUpgradingStage('failed');
+            }
+            setIsLoading(false);
+            return;
+          }
+          
+          // Continue polling with exponential backoff
           setStatusCheckCount(prev => prev + 1);
           
           // If we're still pending and haven't reached max checks
           if (statusCheckCount < maxStatusChecks) {
-            setTimeout(checkStatus, 3000);
+            // Use server-suggested wait time or increase backoff (max 15 seconds)
+            backoffTime = Math.min(nextWaitTime, 15000);
+            console.log(`Next check in ${backoffTime/1000} seconds`);
+            
+            // Store the timeout ID to cancel if component unmounts
+            const timeoutId = setTimeout(checkStatus, backoffTime);
+            window._lastStatusCheckTimeout = timeoutId;
           } else {
-            // Max checks reached, but not failed - tell user to check later
+            // Max checks reached
+            console.log("Maximum polling attempts reached");
             setIsLoading(false);
-            addNotification("Upgrade transaction pending - check back later", 400, 300, "#FF9800");
+            setUpgradingStage('success'); // Assume success
+            
+            // Only call onSuccess once
+            if (!successShownRef.current) {
+              successShownRef.current = true;
+              if (onSuccess) onSuccess();
+              addNotification("Upgrade transaction was sent. Please refresh the page to see updates.", 400, 300, "#4CAF50");
+            }
           }
         } catch (error) {
           console.error("Error checking transaction status:", error);
-          setIsLoading(false);
-          setUpgradingStage('failed');
+          // Only fail after multiple errors
+          if (statusCheckCount > 2) {
+            setIsLoading(false);
+            setUpgradingStage('failed');
+          } else {
+            // Retry with longer backoff on error
+            backoffTime = Math.min(backoffTime * 2, 15000);
+            
+            const timeoutId = setTimeout(checkStatus, backoffTime);
+            window._lastStatusCheckTimeout = timeoutId;
+            
+            setStatusCheckCount(prev => prev + 1);
+          }
         }
       };
       
-      setTimeout(checkStatus, 3000);
+      // Start first check after a small delay
+      const initialTimeoutId = setTimeout(checkStatus, 2000);
+      window._lastStatusCheckTimeout = initialTimeoutId;
+      
+      // Clean up function to prevent memory leaks
+      return () => {
+        if (window._lastStatusCheckTimeout) {
+          clearTimeout(window._lastStatusCheckTimeout);
+        }
+      };
     }
   }, [intentHash, upgradingStage, statusCheckCount, creature, onSuccess, addNotification]);
 

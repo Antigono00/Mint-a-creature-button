@@ -3,11 +3,66 @@ import { useContext } from 'react';
 import { GameContext } from '../context/GameContext';
 
 const WelcomeMessage = () => {
-  const { setShowWelcomeMessage } = useContext(GameContext);
+  const { setShowWelcomeMessage, isMobile } = useContext(GameContext);
+  
+  // Function to close the welcome message
+  const handleClose = () => setShowWelcomeMessage(false);
   
   return (
     <div className="welcome-message">
       <h1>Welcome to Corvax Lab!</h1>
+      
+      {/* Mobile-only sticky top button */}
+      {isMobile && (
+        <div style={{
+          position: 'sticky',
+          top: '10px',
+          zIndex: 5,
+          textAlign: 'center',
+          marginBottom: '15px'
+        }}>
+          <button 
+            onClick={handleClose}
+            style={{
+              backgroundColor: '#4CAF50',
+              color: 'white',
+              border: 'none',
+              borderRadius: '20px',
+              padding: '10px 20px',
+              fontSize: '16px',
+              fontWeight: 'bold',
+              boxShadow: '0 4px 8px rgba(0, 0, 0, 0.2)',
+              cursor: 'pointer',
+              width: '80%',
+              maxWidth: '250px'
+            }}
+          >
+            Start Playing
+          </button>
+        </div>
+      )}
+      
+      {/* New section about Evolving Creatures */}
+      <div style={{ 
+        padding: '15px', 
+        marginBottom: '20px', 
+        background: 'rgba(33, 150, 243, 0.15)', 
+        borderRadius: '8px',
+        border: '1px solid rgba(33, 150, 243, 0.3)'
+      }}>
+        <h3 style={{ margin: '0 0 10px 0', color: '#2196F3' }}>🥚 Evolving Creatures</h3>
+        <p style={{ margin: '0 0 10px 0', fontSize: '16px' }}>
+          Start your adventure by minting your own unique creature:
+        </p>
+        
+        <ul style={{ margin: '0', paddingLeft: '20px' }}>
+          <li>Mint a creature egg and receive a bonus item</li>
+          <li>Each creature is inspired by a Radix project</li>
+          <li>To upgrade stats and evolve, feed your creature with the token of its associated Radix project</li>
+          <li>Collect rare species with different abilities and specialty stats</li>
+          <li>No TCorvax needed - start minting right away!</li>
+        </ul>
+      </div>
       
       <div style={{ 
         padding: '15px', 
@@ -31,13 +86,15 @@ const WelcomeMessage = () => {
         display: 'flex',
         gap: '15px',
         margin: '20px 0',
-        textAlign: 'center'
+        textAlign: 'center',
+        flexWrap: 'wrap'
       }}>
         <div style={{ 
           flex: '1',
           padding: '10px',
           background: 'rgba(0, 0, 0, 0.2)',
-          borderRadius: '8px'
+          borderRadius: '8px',
+          minWidth: isMobile ? '100%' : '140px'
         }}>
           <h3 style={{ margin: '0 0 5px 0', color: '#4CAF50' }}>Desktop Controls</h3>
           <p style={{ margin: '0' }}>
@@ -56,7 +113,8 @@ const WelcomeMessage = () => {
           flex: '1',
           padding: '10px',
           background: 'rgba(0, 0, 0, 0.2)',
-          borderRadius: '8px'
+          borderRadius: '8px',
+          minWidth: isMobile ? '100%' : '140px'
         }}>
           <h3 style={{ margin: '0 0 5px 0', color: '#4CAF50' }}>Mobile Controls</h3>
           <p style={{ margin: '0' }}>
@@ -80,9 +138,12 @@ const WelcomeMessage = () => {
         </p>
       </div>
       
-      <button onClick={() => setShowWelcomeMessage(false)}>
-        Start Playing
-      </button>
+      {/* Only show the bottom button for desktop users */}
+      {!isMobile && (
+        <button onClick={handleClose}>
+          Start Playing
+        </button>
+      )}
     </div>
   );
 };

@@ -8,11 +8,14 @@ const RoomNavigation = () => {
     currentRoom,
     roomsUnlocked, 
     setCurrentRoom,
-    addNotification
+    addNotification,
+    isPanelOpen, // Add this to check if panel is open
+    isMobile     // Add this to check if on mobile
   } = useContext(GameContext);
 
   // Don't show navigation if there's only one room unlocked
-  if (roomsUnlocked <= 1) {
+  // Also don't show on mobile when panel is open
+  if (roomsUnlocked <= 1 || (isMobile && isPanelOpen)) {
     return null;
   }
 
@@ -25,7 +28,10 @@ const RoomNavigation = () => {
   };
 
   return (
-    <div className="room-navigation">
+    <div className="room-navigation" style={{ 
+      zIndex: 7000, // Below mobile HUD but above most UI elements
+      position: 'relative'
+    }}>
       {/* Show left arrow when in room 2 */}
       {currentRoom === 2 && (
         <button 

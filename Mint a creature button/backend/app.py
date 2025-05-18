@@ -4360,7 +4360,30 @@ def test_nft_data():
 # Add this to app.py
 @app.route("/api/checkUpgradeStatus", methods=["POST"])
 def check_upgrade_status():
-    """Check transaction status with improved debugging and force succeed for committed transactions."""
+    """
+    Check transaction status with improved debugging and force succeed for committed transactions.
+    
+    This endpoint checks the status of a blockchain transaction and determines whether
+    it has completed successfully. It includes a critical fix to handle cases where 
+    transactions might be confirmed on the blockchain but not properly reflected
+    in the status checks due to network or API issues.
+    
+    Request body:
+    {
+        "intentHash": "string",   # Required - The transaction intent hash to check
+        "creatureId": "string",   # Required - The ID of the creature being upgraded
+        "checkCount": integer     # Optional - Number of times this transaction has been checked
+    }
+    
+    Response:
+    {
+        "status": "ok" | "error",
+        "transactionStatus": object,   # Status data from the blockchain
+        "shouldRetry": boolean,        # Whether frontend should retry checking
+        "forceSuccess": boolean,       # Whether we're forcing success despite unclear status
+        "message": "string"            # Human-readable status message
+    }
+    """
     try:
         if 'telegram_id' not in session:
             return jsonify({"error": "Not logged in"}), 401

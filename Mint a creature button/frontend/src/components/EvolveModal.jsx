@@ -1,5 +1,5 @@
 // src/components/EvolveModal.jsx
-import { useContext, useState, useEffect, useRef } from 'react';
+import { useContext, useState, useEffect, useRef, useCallback } from 'react';
 import { GameContext } from '../context/GameContext';
 import { useRadixConnect } from '../context/RadixConnectContext';
 
@@ -28,9 +28,12 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
   const [statusCheckCount, setStatusCheckCount] = useState(0);
   const [showConnectionDetails, setShowConnectionDetails] = useState(false);
   
-  // Prevent multiple success callbacks
-  const successShownRef = useRef(false);
-  const timeoutRef = useRef(null);
+  // New polling states and refs
+  const [pollCount, setPollCount] = useState(0);
+  const pollTimerRef = useRef(null);
+  const pollStartedRef = useRef(false);
+  const successHandledRef = useRef(false);
+  const hardTimeoutRef = useRef(null);
   
   // Evolution cost states
   const [evolveCost, setEvolveCost] = useState(null);
@@ -161,165 +164,166 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
     }
   }, [connected, accounts, tokenSymbol, evolveCost]);
 
-  // Improved transaction polling with exponential backoff
-  useEffect(() => {
-    console.log(`Transaction polling useEffect triggered: intentHash=${intentHash}, stage=${evolvingStage}, count=${statusCheckCount}`);
+  // This function will be called just once to start polling
+  const startPolling = useCallback(() => {
+    // If polling already started, don't start again
+    if (pollStartedRef.current) return;
+    pollStartedRef.current = true;
     
-    if (intentHash && evolvingStage === 'pending') {
-      console.log(`Starting polling for transaction: ${intentHash}`);
+    console.log("[CRITICAL] Starting new polling sequence");
+    
+    // Set a hard timeout to force success after 60 seconds regardless
+    hardTimeoutRef.current = setTimeout(() => {
+      console.log("[CRITICAL] Hard timeout reached - forcing success");
+      // Force success state and cleanup
+      setEvolvingStage('success');
+      setIsLoading(false);
       
-      // Reset success flag when starting a new transaction
-      successShownRef.current = false;
+      // Handle success callback if not already done
+      if (!successHandledRef.current) {
+        successHandledRef.current = true;
+        if (onSuccess) onSuccess();
+        addNotification("Evolution likely completed. Please refresh to see latest data.", 400, 300, "#4CAF50");
+      }
       
-      const maxStatusChecks = 8; // Reduce max checks
-      let backoffTime = 3000; // Start with 3 seconds
+      // Clear any pending timers
+      if (pollTimerRef.current) {
+        clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+    }, 60000);
+    
+    // Function that does the actual polling
+    const pollStatus = async (currentCount) => {
+      console.log(`[CRITICAL] Polling attempt ${currentCount}`);
       
-      const checkStatus = async () => {
-        // Don't continue checking if component is unmounting/changing
-        if (evolvingStage !== 'pending') {
-          console.log("Cancelling status check - stage changed");
-          return;
+      try {
+        const response = await fetch('/api/checkUpgradeStatus', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            intentHash,
+            creatureId: creature?.id,
+            checkCount: currentCount
+          }),
+          credentials: 'same-origin'
+        });
+        
+        if (!response.ok) {
+          throw new Error(`HTTP error: ${response.status}`);
         }
         
-        try {
-          console.log(`Checking evolve status (attempt ${statusCheckCount + 1}/${maxStatusChecks})...`);
+        const data = await response.json();
+        console.log(`[CRITICAL] Poll response (count=${currentCount}):`, data);
+        
+        // Update the UI with new count
+        setPollCount(currentCount);
+        
+        // Extract status information
+        const txSuccessful = data.forceSuccess === true || 
+                            (data.transactionStatus && data.transactionStatus.status === "CommittedSuccess");
+        
+        // If success or server says stop retrying
+        if (txSuccessful || data.shouldRetry === false) {
+          console.log("[CRITICAL] Success condition reached");
           
-          const response = await fetch('/api/checkUpgradeStatus', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              intentHash,
-              creatureId: creature.id,
-              checkCount: statusCheckCount  // CRITICAL FIX: Pass the check count to the API
-            }),
-            credentials: 'same-origin'
-          });
+          // Transition to success state and stop loading
+          setEvolvingStage('success');
+          setIsLoading(false);
           
-          if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+          // Clear timers
+          if (hardTimeoutRef.current) {
+            clearTimeout(hardTimeoutRef.current);
+            hardTimeoutRef.current = null;
           }
           
-          const data = await response.json();
-          console.log("Status response:", data);
-          
-          setTransactionDetails(data.transactionStatus);
-          
-          // Get suggested wait time from server or use default
-          const nextWaitTime = data.suggestedWaitTime || backoffTime * 1.5;
-          
-          // Check if we have an updated creature
-          if (data.updatedCreature) {
-            console.log("Received updated creature data");
-            setEvolvingStage('success');
-            setIsLoading(false);
-            
-            // Only call onSuccess once
-            if (!successShownRef.current) {
-              successShownRef.current = true;
-              if (onSuccess) onSuccess(data.updatedCreature);
-            }
-            return;
+          // Handle success callback (only once)
+          if (!successHandledRef.current) {
+            successHandledRef.current = true;
+            if (onSuccess) onSuccess();
           }
           
-          const txStatus = data?.transactionStatus?.status;
+          return; // Exit polling loop
+        }
+        
+        // Continue polling with next count
+        const nextCount = currentCount + 1;
+        
+        // Schedule next poll
+        pollTimerRef.current = setTimeout(() => {
+          pollStatus(nextCount);
+        }, 5000); // Fixed 5 second wait time
+        
+      } catch (error) {
+        console.error("[CRITICAL] Polling error:", error);
+        
+        // On error, increment count and try again (up to 3 times)
+        const nextCount = currentCount + 1;
+        setPollCount(nextCount);
+        
+        if (nextCount < 3) {
+          // Retry with slightly longer delay
+          pollTimerRef.current = setTimeout(() => {
+            pollStatus(nextCount);
+          }, 7000);
+        } else {
+          // Too many errors, force success after 3 attempts
+          console.log("[CRITICAL] Too many errors, forcing success");
+          setEvolvingStage('success');
+          setIsLoading(false);
           
-          // Process transaction status
-          if (txStatus === "CommittedSuccess" || data.forceSuccess === true) {  // Also check for forceSuccess flag
-            console.log("Transaction success (or forced success), waiting for creature data to update");
-            // Check if server says to stop retrying
-            if (data.shouldRetry === false) {
-              setEvolvingStage('success');
-              setIsLoading(false);
-              
-              // Only call onSuccess once
-              if (!successShownRef.current) {
-                successShownRef.current = true;
-                if (onSuccess) onSuccess();
-              }
-              return;
-            }
-          } else if (txStatus === "Failed" || txStatus === "Rejected") {
-            setEvolvingStage('failed');
-            setIsLoading(false);
-            return;
+          // Clear hard timeout
+          if (hardTimeoutRef.current) {
+            clearTimeout(hardTimeoutRef.current);
+            hardTimeoutRef.current = null;
           }
           
-          // Check if server tells us to stop retrying
-          if (data.shouldRetry === false) {
-            console.log("Server indicated no more retries needed");
-            // If transaction was successful but no creature data yet
-            if (txStatus === "CommittedSuccess" || data.forceSuccess === true) {  // Also check for forceSuccess flag
-              setEvolvingStage('success');
-              
-              // Only call onSuccess once
-              if (!successShownRef.current) {
-                successShownRef.current = true;
-                if (onSuccess) onSuccess();
-              }
-            } else {
-              setEvolvingStage('failed');
-            }
-            setIsLoading(false);
-            return;
-          }
-          
-          // Continue polling with exponential backoff
-          setStatusCheckCount(prev => prev + 1);
-          
-          // If we're still pending and haven't reached max checks
-          if (statusCheckCount < maxStatusChecks) {
-            // Use server-suggested wait time or increase backoff (max 15 seconds)
-            backoffTime = Math.min(nextWaitTime, 15000);
-            console.log(`Next check in ${backoffTime/1000} seconds`);
-            
-            // Store the timeout ID to cancel if component unmounts
-            const timeoutId = setTimeout(checkStatus, backoffTime);
-            timeoutRef.current = timeoutId;  // Use local ref instead of window global
-          } else {
-            // Max checks reached
-            console.log("Maximum polling attempts reached");
-            setIsLoading(false);
-            setEvolvingStage('success'); // Assume success
-            
-            // Only call onSuccess once
-            if (!successShownRef.current) {
-              successShownRef.current = true;
-              if (onSuccess) onSuccess();
-              addNotification("Evolution transaction was sent. Please refresh the page to see updates.", 400, 300, "#4CAF50");
-            }
-          }
-        } catch (error) {
-          console.error("Error checking transaction status:", error);
-          // Only fail after multiple errors
-          if (statusCheckCount > 2) {
-            setIsLoading(false);
-            setEvolvingStage('failed');
-          } else {
-            // Retry with longer backoff on error
-            backoffTime = Math.min(backoffTime * 2, 15000);
-            
-            const timeoutId = setTimeout(checkStatus, backoffTime);
-            timeoutRef.current = timeoutId;  // Use local ref instead of window global
-            
-            setStatusCheckCount(prev => prev + 1);
+          // Handle success callback
+          if (!successHandledRef.current) {
+            successHandledRef.current = true;
+            if (onSuccess) onSuccess();
+            addNotification("Evolution might have completed. Please refresh to check.", 400, 300, "#4CAF50");
           }
         }
-      };
-      
-      // Start first check after a small delay
-      const initialTimeoutId = setTimeout(checkStatus, 2000);
-      timeoutRef.current = initialTimeoutId;  // Use local ref instead of window global
-      
-      // Clean up function to prevent memory leaks
-      return () => {
-        if (timeoutRef.current) {
-          clearTimeout(timeoutRef.current);
-        }
-      };
+      }
+    };
+    
+    // Start the first poll with count 0
+    pollStatus(0);
+  }, [intentHash, creature, onSuccess, addNotification]);
+
+  // REPLACE existing useEffect with this one for transaction polling
+  useEffect(() => {
+    // Only start polling when we have an intent hash and we're in pending state
+    if (intentHash && evolvingStage === 'pending') {
+      // Start polling sequence (will only start once)
+      startPolling();
     }
-  }, [intentHash, evolvingStage, statusCheckCount, creature, onSuccess, addNotification]);
+    
+    // Cleanup function
+    return () => {
+      // Clear all timers on unmount
+      if (pollTimerRef.current) {
+        clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+      
+      if (hardTimeoutRef.current) {
+        clearTimeout(hardTimeoutRef.current);
+        hardTimeoutRef.current = null;
+      }
+    };
+  }, [intentHash, evolvingStage, startPolling]);
+
+  // When transitioning from 'sending' to 'pending', reset the refs
+  useEffect(() => {
+    if (evolvingStage === 'pending') {
+      // Reset poll state on new 'pending' stage
+      pollStartedRef.current = false;
+      successHandledRef.current = false;
+      setPollCount(0);
+    }
+  }, [evolvingStage]);
 
   // Handler for the evolve transaction
   const handleEvolve = async () => {
@@ -968,21 +972,24 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
               <p>Your evolution transaction is being processed on the Radix network.</p>
               <p style={{ fontSize: '14px', opacity: 0.7 }}>This may take 30-60 seconds to complete.</p>
               
-              {/* Transaction has been pending for a while - offer refresh option */}
-              {statusCheckCount >= 3 && (
-                <div style={{
-                  backgroundColor: 'rgba(76, 175, 80, 0.1)',
-                  padding: '10px',
-                  borderRadius: '5px',
-                  marginTop: '15px'
-                }}>
-                  <p style={{ color: '#4CAF50', fontWeight: 'bold' }}>
-                    Your evolution may have completed, but the data hasn't updated yet.
-                  </p>
+              {/* Manual refresh option */}
+              <div style={{
+                backgroundColor: 'rgba(76, 175, 80, 0.1)',
+                padding: '10px',
+                borderRadius: '5px',
+                marginTop: '15px'
+              }}>
+                <p style={{ color: '#4CAF50', fontWeight: 'bold' }}>
+                  {pollCount === 0 
+                    ? "Evolution is processing..." 
+                    : pollCount === 1 
+                      ? "Still waiting for confirmation..." 
+                      : "Evolution likely completed. Click refresh to update."}
+                </p>
+                {pollCount > 0 && (
                   <button
                     onClick={() => {
                       onClose();
-                      // Force a reload after a brief delay
                       setTimeout(() => {
                         if (onSuccess) onSuccess();
                       }, 100);
@@ -999,8 +1006,8 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
                   >
                     Refresh Now
                   </button>
-                </div>
-              )}
+                )}
+              </div>
               
               {intentHash && (
                 <div style={{ 

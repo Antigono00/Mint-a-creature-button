@@ -237,17 +237,10 @@ const CreaturesViewer = ({ onClose }) => {
         return newCreatures;
       });
     } else {
-      // If no direct creature data, schedule a reload after a delay
-      const delayTime = 3000;
-      console.log(`Scheduling reload after ${delayTime/1000} seconds`);
-      // Use a unique timeout ID and store it to avoid duplicate reloads
-      const timeoutId = setTimeout(() => {
-        console.log("Executing delayed reload");
-        loadCreatures(true); // Force reload
-      }, delayTime);
-      
-      // Store the timeout ID to potentially cancel it
-      window._lastUpgradeTimeout = timeoutId;
+      // If no direct creature data, reload immediately
+      // MODIFIED: Changed from delayed reload to immediate reload for consistency
+      console.log("No updated creature data - forcing immediate reload");
+      loadCreatures(true); // Force reload
     }
   }, [accounts, addNotification, loadCreatures]);
 

@@ -1270,6 +1270,112 @@ def calculate_upgrade_cost(creature, energy=0, strength=0, magic=0, stamina=0, s
             "token": "XRD",
             "amount": 50  # Safe fallback
         }
+    
+def calculate_evolution_cost(creature):
+    """
+    Calculate the cost for evolving a creature to the next form.
+    Returns: dict with evolution status and cost info
+    """
+    try:
+        # First try to use the provided creature data
+        if not creature:
+            print("Warning: No creature data provided for evolution cost calculation")
+            return {"can_evolve": False, "reason": "No creature data provided"}
+            
+        # Get species info
+        species_id = None
+        try:
+            # Ensure species_id is an integer
+            species_id = int(creature.get("species_id", 1))
+        except (ValueError, TypeError):
+            # If conversion fails, try to use the value directly
+            species_id = creature.get("species_id", 1)
+            
+        species_info = SPECIES_DATA.get(species_id)
+        
+        # If not found by ID, try by name as a fallback
+        if not species_info and "species_name" in creature:
+            species_name = creature.get("species_name", "").lower()
+            for sid, data in SPECIES_DATA.items():
+                if data["name"].lower() == species_name:
+                    species_info = data
+                    species_id = sid
+                    break
+        
+        # If still not found, use default
+        if not species_info:
+            species_info = SPECIES_DATA[1]  # Default to Bullx
+            species_id = 1
+        
+        # Get form (ensure it's an integer)
+        form = 0
+        try:
+            form = int(creature.get("form", 0))
+        except (ValueError, TypeError):
+            form = 0
+        
+        # Check if creature can evolve
+        if form >= 3:
+            return {"can_evolve": False, "reason": "Creature is already at final form"}
+            
+        evolution_progress = creature.get("evolution_progress", {})
+        if not evolution_progress:
+            return {"can_evolve": False, "reason": "No evolution progress data"}
+            
+        stat_upgrades_completed = 0
+        try:
+            stat_upgrades_completed = int(evolution_progress.get("stat_upgrades_completed", 0))
+        except (ValueError, TypeError):
+            stat_upgrades_completed = 0
+            
+        if stat_upgrades_completed < 3:
+            remaining = 3 - stat_upgrades_completed
+            return {
+                "can_evolve": False, 
+                "reason": f"Need {remaining} more stat upgrade(s) before evolving", 
+                "completed": stat_upgrades_completed
+            }
+        
+        # Get preferred token
+        token_symbol = species_info.get("preferred_token", "XRD")
+        
+        # Get evolution prices
+        evolution_prices = species_info.get("evolution_prices", [50, 100, 200])
+        if form < len(evolution_prices):
+            evolution_price = evolution_prices[form]
+        else:
+            evolution_price = evolution_prices[-1]
+        
+        # Fixed calculation: 60% already paid in stat upgrades, 40% remaining for evolution
+        paid_percentage = 0.6  # Fixed at 60% regardless of actual upgrades
+        remaining_percentage = 0.4  # Fixed at 40% for the evolution step
+        evolution_cost = evolution_price * remaining_percentage
+        
+        # Ensure minimum cost of 1 token for most tokens
+        # But allow decimal values for tokens that support it (like FLOOP or CASSIE)
+        if token_symbol in ["FLOOP", "CASSIE"]:
+            # Ensure at least 0.001 for tokens that can have small decimal amounts
+            evolution_cost = max(0.001, evolution_cost)
+        else:
+            # Round to nearest integer for most tokens
+            evolution_cost = max(1, int(round(evolution_cost)))
+        
+        print(f"Calculated evolution cost for {species_info['name']} (form {form}): {evolution_cost} {token_symbol}")
+        print(f"Base evolution price: {evolution_price}, Fixed remaining: 40%")
+            
+        return {
+            "can_evolve": True,
+            "token": token_symbol,
+            "amount": evolution_cost,
+            "next_form": form + 1
+        }
+    except Exception as e:
+        print(f"Error calculating evolution cost: {e}")
+        traceback.print_exc()
+        return {
+            "can_evolve": False,
+            "reason": f"Error: {str(e)}"
+        }
 
 def can_build_fomo_hit(cur, user_id):
     """Check if user has built and fully operational all other machine types."""
@@ -4265,98 +4371,36 @@ def check_upgrade_status():
         if not intent_hash:
             return jsonify({"error": "Missing transaction intent hash"}), 400
             
-        # Track API calls per session to prevent excessive calls
-        session_id = session.get('telegram_id')
-        call_counter_key = f"upgrade_status_calls_{session_id}_{intent_hash}"
-        call_counter = session.get(call_counter_key, 0)
-        
-        # Implement call rate limiting (max 5 calls per 30 seconds for same transaction)
-        if call_counter > 5:
-            # Return last known state without making external API calls
-            return jsonify({
-                "status": "rate_limited",
-                "message": "Too many status check requests. Please wait a moment before trying again.",
-                "transactionStatus": {"status": "Unknown", "message": "Rate limited"},
-                "shouldRetry": False  # Signal to client to stop polling
-            })
-        
-        # Increment counter
-        session[call_counter_key] = call_counter + 1
-        
-        # Get the transaction status
+        # Get the transaction status WITHOUT using session rate limiting
+        # This might have been causing issues if session data wasn't persisting correctly
         status_data = get_transaction_status(intent_hash)
         
-        # If the transaction is committed successfully, try to get updated NFT data
-        updated_creature = None
-        
+        # If the transaction is committed successfully, always respond with success=true
+        # This is the most important fix - we're automatically returning success for committed transactions
         if status_data.get("status") == "CommittedSuccess":
-            try:
-                # Add a small delay to allow blockchain state to update before fetching
-                time.sleep(1)
-                
-                # Try to get the updated creature data from the blockchain
-                user_id = session['telegram_id']
-                conn = get_db_connection()
-                cur = conn.cursor()
-                
-                # Check if we have a stored Radix account
-                cur.execute("""
-                    SELECT radix_account_address FROM users 
-                    WHERE user_id = ? AND radix_account_address IS NOT NULL
-                """, (user_id,))
-                
-                row = cur.fetchone()
-                account_address = None
-                if row:
-                    account_address = row['radix_account_address']
-                
-                cur.close()
-                conn.close()
-                
-                # If we have an account address, try to fetch the updated creature
-                if account_address and creature_id:
-                    try:
-                        # Fetch NFT data for the specific creature ID
-                        nft_data_map = fetch_nft_data(CREATURE_NFT_RESOURCE, [creature_id])
-                        
-                        if nft_data_map and creature_id in nft_data_map:
-                            raw_data = nft_data_map[creature_id]
-                            updated_creature = process_creature_data(creature_id, raw_data)
-                            print(f"Successfully retrieved updated creature data")
-                            # Clear session counter on success
-                            session.pop(call_counter_key, None)
-                    except Exception as inner_e:
-                        print(f"Error fetching creature data: {str(inner_e)}")
-                        traceback.print_exc()
-            except Exception as e:
-                print(f"Error in checkUpgradeStatus: {e}")
-                traceback.print_exc()
+            print(f"Transaction {intent_hash} is committed successfully, returning success response")
+            # For committed transactions, tell the client it's okay to stop polling
+            # We don't need to fetch the updated creature - the client will refresh the page
+            return jsonify({
+                "status": "ok",
+                "transactionStatus": status_data,
+                "shouldRetry": False,  # Don't keep polling
+                "message": "Transaction is confirmed on blockchain. Refresh the page to see updates."
+            })
         
-        # For pending transactions, allow continued polling with decreasing frequency
-        if status_data.get("status") in ["Pending", "Submitted", "Unknown"]:
-            # Allow polling but reduce frequency based on counter
-            shouldRetry = True
-            # Suggest a longer wait time as the counter increases
-            suggested_wait = min(3000 * (1.5 ** min(call_counter, 5)), 20000)  # Max 20 seconds
-        else:
-            # For any other status (success, failure, etc), stop polling
-            shouldRetry = False
-            # Clear session counter
-            session.pop(call_counter_key, None)
-        
+        # For non-committed transactions, allow continued polling
         return jsonify({
             "status": "ok",
             "transactionStatus": status_data,
-            "updatedCreature": updated_creature,
-            "shouldRetry": shouldRetry,  # Signal whether client should continue polling
-            "suggestedWaitTime": suggested_wait if 'suggested_wait' in locals() else 3000  # Default 3 seconds
+            "shouldRetry": True,  # Keep polling for non-committed transactions
+            "suggestedWaitTime": 3000  # Default 3 seconds
         })
     except Exception as e:
         print(f"Error checking upgrade status: {e}")
         traceback.print_exc()
         return jsonify({
             "error": f"Server error: {str(e)}",
-            "shouldRetry": False  # Stop polling on server errors
+            "shouldRetry": False
         }), 500
     
 # Add this to app.py after the checkXrdBalance endpoint
@@ -4497,6 +4541,7 @@ def get_upgrade_stats_manifest():
         print(f"Error in get_upgrade_stats_manifest: {e}")
         traceback.print_exc()
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+    
 
 @app.route("/api/getEvolveManifest", methods=["POST"])
 def get_evolve_manifest():

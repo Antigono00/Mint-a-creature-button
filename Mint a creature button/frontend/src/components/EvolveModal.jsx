@@ -30,6 +30,7 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
   
   // Prevent multiple success callbacks
   const successShownRef = useRef(false);
+  const timeoutRef = useRef(null);
   
   // Evolution cost states
   const [evolveCost, setEvolveCost] = useState(null);
@@ -162,7 +163,11 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
 
   // Improved transaction polling with exponential backoff
   useEffect(() => {
+    console.log(`Transaction polling useEffect triggered: intentHash=${intentHash}, stage=${evolvingStage}, count=${statusCheckCount}`);
+    
     if (intentHash && evolvingStage === 'pending') {
+      console.log(`Starting polling for transaction: ${intentHash}`);
+      
       // Reset success flag when starting a new transaction
       successShownRef.current = false;
       
@@ -186,7 +191,8 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
             },
             body: JSON.stringify({
               intentHash,
-              creatureId: creature.id
+              creatureId: creature.id,
+              checkCount: statusCheckCount  // CRITICAL FIX: Pass the check count to the API
             }),
             credentials: 'same-origin'
           });
@@ -220,8 +226,8 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
           const txStatus = data?.transactionStatus?.status;
           
           // Process transaction status
-          if (txStatus === "CommittedSuccess") {
-            console.log("Transaction success, waiting for creature data to update");
+          if (txStatus === "CommittedSuccess" || data.forceSuccess === true) {  // Also check for forceSuccess flag
+            console.log("Transaction success (or forced success), waiting for creature data to update");
             // Check if server says to stop retrying
             if (data.shouldRetry === false) {
               setEvolvingStage('success');
@@ -244,7 +250,7 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
           if (data.shouldRetry === false) {
             console.log("Server indicated no more retries needed");
             // If transaction was successful but no creature data yet
-            if (txStatus === "CommittedSuccess") {
+            if (txStatus === "CommittedSuccess" || data.forceSuccess === true) {  // Also check for forceSuccess flag
               setEvolvingStage('success');
               
               // Only call onSuccess once
@@ -270,7 +276,7 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
             
             // Store the timeout ID to cancel if component unmounts
             const timeoutId = setTimeout(checkStatus, backoffTime);
-            window._lastStatusCheckTimeout = timeoutId;
+            timeoutRef.current = timeoutId;  // Use local ref instead of window global
           } else {
             // Max checks reached
             console.log("Maximum polling attempts reached");
@@ -295,7 +301,7 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
             backoffTime = Math.min(backoffTime * 2, 15000);
             
             const timeoutId = setTimeout(checkStatus, backoffTime);
-            window._lastStatusCheckTimeout = timeoutId;
+            timeoutRef.current = timeoutId;  // Use local ref instead of window global
             
             setStatusCheckCount(prev => prev + 1);
           }
@@ -304,12 +310,12 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
       
       // Start first check after a small delay
       const initialTimeoutId = setTimeout(checkStatus, 2000);
-      window._lastStatusCheckTimeout = initialTimeoutId;
+      timeoutRef.current = initialTimeoutId;  // Use local ref instead of window global
       
       // Clean up function to prevent memory leaks
       return () => {
-        if (window._lastStatusCheckTimeout) {
-          clearTimeout(window._lastStatusCheckTimeout);
+        if (timeoutRef.current) {
+          clearTimeout(timeoutRef.current);
         }
       };
     }
@@ -326,6 +332,7 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
     setIsLoading(true);
     setEvolvingStage('sending');
     setError(null);
+    setStatusCheckCount(0);  // Reset status check count when starting new transaction
     
     try {
       // Fetch the manifest for evolving
@@ -541,7 +548,7 @@ const EvolveModal = ({ onClose, creature, onSuccess }) => {
           flexWrap: 'wrap',
           gap: '10px'
         }}>
-          <h2 style={{ margin: 0, color: '#FF9800' }}> Evolve Creature {/* Temporary indicator - remove after confirming */} <span style={{ fontSize: '10px', color: 'lime' }}> v2</span> </h2>
+          <h2 style={{ margin: 0, color: '#FF9800' }}> Evolve Creature </h2>
           
           <div style={{ display: 'flex', gap: '10px' }}>
             {/* Action button based on stage */}

@@ -3,6 +3,7 @@ import { useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { GameContext } from '../context/GameContext';
 import { useRadixConnect } from '../context/RadixConnectContext';
 import UpgradeStatsModal from './UpgradeStatsModal';
+import EvolveModal from './EvolveModal';
 
 const CreaturesViewer = ({ onClose }) => {
   // Game context
@@ -39,6 +40,10 @@ const CreaturesViewer = ({ onClose }) => {
   // Upgrade modal states
   const [showUpgradeModal, setShowUpgradeModal] = useState(false);
   const [creatureToUpgrade, setCreatureToUpgrade] = useState(null);
+
+  // Evolution modal states
+  const [showEvolveModal, setShowEvolveModal] = useState(false);
+  const [creatureToEvolve, setCreatureToEvolve] = useState(null);
 
   // Load creatures from the API
   const loadCreatures = useCallback(async (force = false) => {
@@ -246,6 +251,53 @@ const CreaturesViewer = ({ onClose }) => {
     }
   }, [accounts, addNotification, loadCreatures]);
 
+  // Function to handle evolution
+  const handleEvolveCreature = (creature) => {
+    setCreatureToEvolve(creature);
+    setShowEvolveModal(true);
+  };
+
+  // Function to handle successful evolution
+  const handleEvolveSuccess = useCallback((updatedCreature) => {
+    // Prevent duplicate notifications by checking timing
+    const now = Date.now();
+    const lastNotificationTime = parseInt(localStorage.getItem('last_evolve_notification') || '0');
+    
+    if (now - lastNotificationTime > 2000) {
+      // Store the notification time
+      localStorage.setItem('last_evolve_notification', now.toString());
+      
+      // Show success notification with unique ID to prevent duplicates
+      const notificationId = "evolve-success-" + now;
+      addNotification?.('Creature evolved successfully!', 400, 300, '#FF9800', notificationId);
+    }
+    
+    // If we have an updated creature directly, use it
+    if (updatedCreature) {
+      // Update the creature in the local state instead of reloading everything
+      setCreatures(prevCreatures => {
+        const newCreatures = prevCreatures.map(c => 
+          c.id === updatedCreature.id ? updatedCreature : c
+        );
+        
+        // Also update cache
+        if (accounts && accounts.length > 0) {
+          const accountAddress = accounts[0].address;
+          localStorage.setItem(`creatures_${accountAddress}`, JSON.stringify({
+            creatures: newCreatures,
+            timestamp: Date.now()
+          }));
+        }
+        
+        return newCreatures;
+      });
+    } else {
+      // No direct creature data - IMMEDIATELY reload creatures
+      console.log("No updated creature data - forcing immediate reload");
+      loadCreatures(true); // Force reload
+    }
+  }, [accounts, addNotification, loadCreatures]);
+
   // Use useEffect to setup periodic refresh attempts after failed loads
   useEffect(() => {
     // If we have an error and no creatures, try to reload periodically
@@ -265,6 +317,9 @@ const CreaturesViewer = ({ onClose }) => {
     return () => {
       if (window._lastUpgradeTimeout) {
         clearTimeout(window._lastUpgradeTimeout);
+      }
+      if (window._lastEvolveTimeout) {
+        clearTimeout(window._lastEvolveTimeout);
       }
     };
   }, []);
@@ -1011,10 +1066,7 @@ const CreaturesViewer = ({ onClose }) => {
                                 alignItems: 'center',
                                 gap: '5px'
                               }}
-                              onClick={() => {
-                                // For now, just show stats - would link to evolve UI
-                                handleViewStatsDetail(selectedCreature);
-                              }}
+                              onClick={() => handleEvolveCreature(selectedCreature)}
                             >
                               <span role="img" aria-label="evolve">✨</span>
                               Evolve
@@ -1514,6 +1566,10 @@ const CreaturesViewer = ({ onClose }) => {
                     alignItems: 'center',
                     gap: '5px'
                   }}
+                  onClick={() => {
+                    handleCloseStatsDetail();
+                    handleEvolveCreature(detailedCreature);
+                  }}
                 >
                   <span role="img" aria-label="evolve">✨</span>
                   Evolve
@@ -1544,6 +1600,15 @@ const CreaturesViewer = ({ onClose }) => {
           creature={creatureToUpgrade}
           onClose={() => setShowUpgradeModal(false)}
           onSuccess={handleUpgradeSuccess}
+        />
+      )}
+      
+      {/* Evolution Modal */}
+      {showEvolveModal && creatureToEvolve && (
+        <EvolveModal 
+          creature={creatureToEvolve}
+          onClose={() => setShowEvolveModal(false)}
+          onSuccess={handleEvolveSuccess}
         />
       )}
       

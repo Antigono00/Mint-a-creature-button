@@ -30,6 +30,7 @@ const UpgradeStatsModal = ({ onClose, creature, onSuccess }) => {
   
   // Add to the top of the component
   const successShownRef = useRef(false);
+  const timeoutRef = useRef(null);
   
   // Stats allocation states
   const [energyPoints, setEnergyPoints] = useState(0);
@@ -185,7 +186,11 @@ const UpgradeStatsModal = ({ onClose, creature, onSuccess }) => {
 
   // Improved transaction polling with exponential backoff
   useEffect(() => {
+    console.log(`Transaction polling useEffect triggered: intentHash=${intentHash}, stage=${upgradingStage}, count=${statusCheckCount}`);
+    
     if (intentHash && upgradingStage === 'pending') {
+      console.log(`Starting polling for transaction: ${intentHash}`);
+      
       // Reset success flag when starting a new transaction
       successShownRef.current = false;
       
@@ -209,7 +214,8 @@ const UpgradeStatsModal = ({ onClose, creature, onSuccess }) => {
             },
             body: JSON.stringify({
               intentHash,
-              creatureId: creature.id
+              creatureId: creature.id,
+              checkCount: statusCheckCount  // CRITICAL FIX: Pass the check count to the API
             }),
             credentials: 'same-origin'
           });
@@ -243,8 +249,8 @@ const UpgradeStatsModal = ({ onClose, creature, onSuccess }) => {
           const txStatus = data?.transactionStatus?.status;
           
           // Process transaction status
-          if (txStatus === "CommittedSuccess") {
-            console.log("Transaction success, waiting for creature data to update");
+          if (txStatus === "CommittedSuccess" || data.forceSuccess === true) {  // Also check for forceSuccess flag
+            console.log("Transaction success (or forced success), waiting for creature data to update");
             // Check if server says to stop retrying
             if (data.shouldRetry === false) {
               setUpgradingStage('success');
@@ -267,7 +273,7 @@ const UpgradeStatsModal = ({ onClose, creature, onSuccess }) => {
           if (data.shouldRetry === false) {
             console.log("Server indicated no more retries needed");
             // If transaction was successful but no creature data yet
-            if (txStatus === "CommittedSuccess") {
+            if (txStatus === "CommittedSuccess" || data.forceSuccess === true) {  // Also check for forceSuccess flag
               setUpgradingStage('success');
               
               // Only call onSuccess once
@@ -293,7 +299,7 @@ const UpgradeStatsModal = ({ onClose, creature, onSuccess }) => {
             
             // Store the timeout ID to cancel if component unmounts
             const timeoutId = setTimeout(checkStatus, backoffTime);
-            window._lastStatusCheckTimeout = timeoutId;
+            timeoutRef.current = timeoutId;  // Use local ref instead of window global
           } else {
             // Max checks reached
             console.log("Maximum polling attempts reached");
@@ -318,7 +324,7 @@ const UpgradeStatsModal = ({ onClose, creature, onSuccess }) => {
             backoffTime = Math.min(backoffTime * 2, 15000);
             
             const timeoutId = setTimeout(checkStatus, backoffTime);
-            window._lastStatusCheckTimeout = timeoutId;
+            timeoutRef.current = timeoutId;  // Use local ref instead of window global
             
             setStatusCheckCount(prev => prev + 1);
           }
@@ -327,12 +333,12 @@ const UpgradeStatsModal = ({ onClose, creature, onSuccess }) => {
       
       // Start first check after a small delay
       const initialTimeoutId = setTimeout(checkStatus, 2000);
-      window._lastStatusCheckTimeout = initialTimeoutId;
+      timeoutRef.current = initialTimeoutId;  // Use local ref instead of window global
       
       // Clean up function to prevent memory leaks
       return () => {
-        if (window._lastStatusCheckTimeout) {
-          clearTimeout(window._lastStatusCheckTimeout);
+        if (timeoutRef.current) {
+          clearTimeout(timeoutRef.current);
         }
       };
     }
@@ -405,6 +411,7 @@ const UpgradeStatsModal = ({ onClose, creature, onSuccess }) => {
     setIsLoading(true);
     setUpgradingStage('sending');
     setError(null);
+    setStatusCheckCount(0);  // Reset status check count when starting new transaction
     
     try {
       // Fetch the manifest for upgrading stats
@@ -1502,6 +1509,40 @@ const UpgradeStatsModal = ({ onClose, creature, onSuccess }) => {
               
               <p>Your upgrade transaction is being processed on the Radix network.</p>
               <p style={{ fontSize: '14px', opacity: 0.7 }}>This may take 30-60 seconds to complete.</p>
+              
+              {/* Transaction has been pending for a while - offer refresh option */}
+              {statusCheckCount >= 3 && (
+                <div style={{
+                  backgroundColor: 'rgba(76, 175, 80, 0.1)',
+                  padding: '10px',
+                  borderRadius: '5px',
+                  marginTop: '15px'
+                }}>
+                  <p style={{ color: '#4CAF50', fontWeight: 'bold' }}>
+                    Your upgrade may have completed, but the data hasn't updated yet.
+                  </p>
+                  <button
+                    onClick={() => {
+                      onClose();
+                      // Force a reload after a brief delay
+                      setTimeout(() => {
+                        if (onSuccess) onSuccess();
+                      }, 100);
+                    }}
+                    style={{
+                      backgroundColor: '#4CAF50',
+                      color: 'white',
+                      padding: '8px 16px',
+                      borderRadius: '5px',
+                      border: 'none',
+                      cursor: 'pointer',
+                      marginTop: '10px'
+                    }}
+                  >
+                    Refresh Now
+                  </button>
+                </div>
+              )}
               
               {intentHash && (
                 <div style={{ 

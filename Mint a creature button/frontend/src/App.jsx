@@ -1,4 +1,4 @@
-// src/App.jsx - Updated with Room Navigation
+// src/App.jsx - Updated with Room Navigation and z-index fixes
 import { useContext, useEffect } from 'react';
 import { GameContext } from './context/GameContext';
 import TelegramLogin from './components/TelegramLogin';
@@ -9,7 +9,7 @@ import WelcomeMessage from './components/WelcomeMessage';
 import LowCorvaxMessage from './components/LowCorvaxMessage';
 import HelpButton from './components/HelpButton';
 import MobileRadixWrapper from './components/MobileRadixWrapper';
-import RoomUnlockMessage from './components/RoomUnlockMessage'; // Add this import
+import RoomUnlockMessage from './components/RoomUnlockMessage';
 
 // Import the Radix Connect Provider & Button
 import { RadixConnectProvider } from './context/RadixConnectContext';
@@ -28,7 +28,7 @@ function App() {
     loadGameFromServer,
     setAssetsLoaded,
     isMobile,
-    showRoomUnlockMessage // Add this state from context
+    showRoomUnlockMessage
   } = useContext(GameContext);
 
   // Preload images
@@ -81,6 +81,46 @@ function App() {
   // Wrap everything in the RadixConnectProvider
   return (
     <RadixConnectProvider dAppDefinitionAddress={dAppDefinitionAddress}>
+      {/* Z-index styles for proper mobile layering */}
+      <style jsx>{`
+        .app-container {
+          position: relative;
+          width: 100%;
+          height: 100%;
+        }
+        
+        .game-container {
+          position: relative;
+          z-index: 100;
+        }
+        
+        .game-container.mobile {
+          position: relative;
+          z-index: 5000; /* Below mobile HUD and side panel but above most other elements */
+        }
+        
+        /* Fixed z-index hierarchy for mobile UI */
+        .mobile-menu-btn {
+          z-index: 10001 !important; /* Highest */
+        }
+        
+        .low-corvax-message {
+          z-index: 10010 !important; /* Highest for messages */
+        }
+        
+        .side-panel {
+          z-index: 9999 !important; /* Very high but below message */
+        }
+        
+        .mobile-hud {
+          z-index: 8000 !important; /* High but below side panel */
+        }
+        
+        .room-navigation {
+          z-index: 7000 !important; /* Below mobile HUD */
+        }
+      `}</style>
+
       <div className="app-container">
         {!isLoggedIn && <TelegramLogin />}
 

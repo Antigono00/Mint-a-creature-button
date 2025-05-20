@@ -4,6 +4,7 @@ import { GameContext } from '../context/GameContext';
 import { useRadixConnect } from '../context/RadixConnectContext';
 import UpgradeStatsModal from './UpgradeStatsModal';
 import EvolveModal from './EvolveModal';
+import ItemsViewer from './ItemsViewer';
 
 const CreaturesViewer = ({ onClose }) => {
   // Game context
@@ -44,6 +45,9 @@ const CreaturesViewer = ({ onClose }) => {
   // Evolution modal states
   const [showEvolveModal, setShowEvolveModal] = useState(false);
   const [creatureToEvolve, setCreatureToEvolve] = useState(null);
+  
+  // Items viewer modal state
+  const [showItemsViewer, setShowItemsViewer] = useState(false);
 
   // Load creatures from the API
   const loadCreatures = useCallback(async (force = false) => {
@@ -487,6 +491,24 @@ const CreaturesViewer = ({ onClose }) => {
           <h2 style={{ margin: 0, color: '#4CAF50' }}>Your Evolving Creatures</h2>
           
           <div style={{ display: 'flex', gap: '10px' }}>
+            {/* Button to view tools and spells */}
+            <button
+              onClick={() => setShowItemsViewer(true)}
+              style={{
+                backgroundColor: '#9C27B0',
+                color: 'white',
+                padding: '8px 16px',
+                borderRadius: '5px',
+                border: 'none',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '5px'
+              }}
+            >
+              <span role="img" aria-label="magic">✨</span> View Tools & Spells
+            </button>
+            
             {/* Refresh button */}
             {showRefreshButton && (
               <button
@@ -1603,6 +1625,11 @@ const CreaturesViewer = ({ onClose }) => {
           onClose={() => setShowEvolveModal(false)}
           onSuccess={handleEvolveSuccess}
         />
+      )}
+      
+      {/* Items Viewer Modal */}
+      {showItemsViewer && (
+        <ItemsViewer onClose={() => setShowItemsViewer(false)} />
       )}
       
       <style>{`

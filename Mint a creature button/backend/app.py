@@ -2753,6 +2753,176 @@ def upgrade_cost(cur, user_id, machine_type, current_level, machine_id):
         print(f"Error in upgrade_cost: {e}")
         traceback.print_exc()
         return None
+    
+# Add these functions to app.py after process_creature_data
+
+def process_tool_data(nft_id: str, pj_raw) -> dict:
+    """
+    Process raw tool NFT data into a format usable by the frontend.
+    """
+    # 1. Normalize the raw blob
+    if pj_raw is None:
+        pj = {}
+    elif isinstance(pj_raw, str):
+        try:
+            pj = json.loads(pj_raw)
+        except json.JSONDecodeError:
+            pj = {}
+    elif isinstance(pj_raw, list):
+        pj = pj_raw[0] if pj_raw else {}
+    else:
+        pj = pj_raw
+    
+    # Extract basic information
+    tool_name = pj.get("tool_name", "Unknown Tool")
+    tool_type = pj.get("tool_type", "unknown")
+    tool_effect = pj.get("tool_effect", "unknown")
+    key_image_url = pj.get("key_image_url", "")
+    image_url = pj.get("image_url", "")
+    
+    # Default images if not provided
+    if not image_url:
+        image_url = "https://cvxlab.net/assets/tools/babylon_keystone.png"
+    
+    if not key_image_url:
+        key_image_url = image_url
+    
+    return {
+        "id": nft_id,
+        "name": tool_name,
+        "type": "tool",
+        "tool_type": tool_type,
+        "tool_effect": tool_effect,
+        "key_image_url": key_image_url,
+        "image_url": image_url,
+        "version": pj.get("version", 1)
+    }
+
+def process_spell_data(nft_id: str, pj_raw) -> dict:
+    """
+    Process raw spell NFT data into a format usable by the frontend.
+    """
+    # 1. Normalize the raw blob
+    if pj_raw is None:
+        pj = {}
+    elif isinstance(pj_raw, str):
+        try:
+            pj = json.loads(pj_raw)
+        except json.JSONDecodeError:
+            pj = {}
+    elif isinstance(pj_raw, list):
+        pj = pj_raw[0] if pj_raw else {}
+    else:
+        pj = pj_raw
+    
+    # Extract basic information
+    spell_name = pj.get("spell_name", "Unknown Spell")
+    spell_type = pj.get("spell_type", "unknown")
+    spell_effect = pj.get("spell_effect", "unknown")
+    key_image_url = pj.get("key_image_url", "")
+    image_url = pj.get("image_url", "")
+    
+    # Default images if not provided
+    if not image_url:
+        image_url = "https://cvxlab.net/assets/spells/babylon_burst.png"
+    
+    if not key_image_url:
+        key_image_url = image_url
+    
+    return {
+        "id": nft_id,
+        "name": spell_name,
+        "type": "spell",
+        "spell_type": spell_type,
+        "spell_effect": spell_effect,
+        "key_image_url": key_image_url,
+        "image_url": image_url,
+        "version": pj.get("version", 1)
+    }
+
+@app.route("/api/getUserItems", methods=["GET", "POST"])
+def get_user_items():
+    """
+    Get all tools and spells for a user.
+    """
+    try:
+        if 'telegram_id' not in session:
+            return jsonify({"error": "Not logged in"}), 401
+
+        user_id = session['telegram_id']
+        
+        # Get account address - prioritize different sources
+        account_address = None
+        
+        # 1. First try request body (POST)
+        if request.method == "POST" and request.json:
+            account_address = request.json.get("accountAddress")
+            print(f"Using account address from POST body: {account_address}")
+            
+        # 2. Then try query parameters (GET)
+        if not account_address and request.args:
+            account_address = request.args.get("accountAddress")
+            print(f"Using account address from URL params: {account_address}")
+            
+        # 3. Finally try stored account
+        if not account_address:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            cur.execute("""
+                SELECT radix_account_address FROM users 
+                WHERE user_id = ? AND radix_account_address IS NOT NULL
+            """, (user_id,))
+            
+            row = cur.fetchone()
+            if row:
+                account_address = row['radix_account_address']
+                print(f"Using stored account address: {account_address}")
+            
+            cur.close()
+            conn.close()
+        
+        # If still no account address, return empty list
+        if not account_address:
+            print(f"No Radix account address found for user {user_id}")
+            return jsonify({"tools": [], "spells": []})
+        
+        # Fetch tool NFTs
+        print(f"Fetching tool NFT IDs for account: {account_address}")
+        tool_ids = get_account_nfids(account_address, TOOL_NFT_RESOURCE)
+        
+        if tool_ids:
+            print(f"Found {len(tool_ids)} tool NFTs")
+            tool_data_map = fetch_nft_data(TOOL_NFT_RESOURCE, tool_ids)
+            tools = []
+            
+            for nft_id, raw_data in tool_data_map.items():
+                processed_data = process_tool_data(nft_id, raw_data)
+                tools.append(processed_data)
+        else:
+            tools = []
+            
+        # Fetch spell NFTs
+        print(f"Fetching spell NFT IDs for account: {account_address}")
+        spell_ids = get_account_nfids(account_address, SPELL_NFT_RESOURCE)
+        
+        if spell_ids:
+            print(f"Found {len(spell_ids)} spell NFTs")
+            spell_data_map = fetch_nft_data(SPELL_NFT_RESOURCE, spell_ids)
+            spells = []
+            
+            for nft_id, raw_data in spell_data_map.items():
+                processed_data = process_spell_data(nft_id, raw_data)
+                spells.append(processed_data)
+        else:
+            spells = []
+            
+        return jsonify({"tools": tools, "spells": spells})
+        
+    except Exception as e:
+        print(f"Error in get_user_items: {e}")
+        traceback.print_exc()
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/dismissRoomUnlock", methods=["POST"])
 def dismiss_room_unlock():
